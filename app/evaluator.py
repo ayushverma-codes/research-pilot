@@ -41,6 +41,13 @@ from app.llm_provider import get_llm_client
 # forever. Configurable for experimentation, but always enforced.
 MAX_ITERATIONS = int(os.getenv("RESEARCHPILOT_MAX_ITERATIONS", "3"))
 
+# Token budget for the critic's own JSON response. Live testing showed 700
+# was too tight once the critic has several quality "issues" to describe on
+# top of "missing_information"/"additional_queries" - the response got cut
+# off mid-string, which then failed JSON parsing entirely (see
+# _extract_json_object) instead of just being a slightly shorter verdict.
+EVALUATOR_MAX_TOKENS = int(os.getenv("RESEARCHPILOT_EVALUATOR_MAX_TOKENS", "1200"))
+
 EVALUATOR_SYSTEM_PROMPT = """You are a research evidence checker (critic).
 Given a research goal and the findings gathered so far, judge the evidence
 on two dimensions:
@@ -87,12 +94,36 @@ Rules:
 URL_RE = re.compile(r"https?://\S+")
 
 
+
+# How much of a bad/truncated LLM response to echo back in an error
+# message. Just enough to diagnose what went wrong (e.g. "it looks like
+# the JSON got cut off here") without dumping the model's entire,
+# possibly very long, raw reply - that raw text can end up embedded in
+# `state.critique["issues"]` and from there directly into the final
+# report's Limitations section (see reporter._build_limitations), so an
+# unbounded echo here would leak into user-facing output too.
+_ERROR_PREVIEW_CHARS = 200
+
+
+def _preview(text: str, max_chars: int = _ERROR_PREVIEW_CHARS) -> str:
+    """Collapse whitespace and truncate `text` for use inside an error message."""
+    collapsed = " ".join(text.split())
+    if len(collapsed) > max_chars:
+        return collapsed[:max_chars] + "...(truncated)"
+    return collapsed
+
+
 def _extract_json_object(text: str) -> dict:
     """Best-effort extraction of a JSON object from an LLM response."""
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if not match:
-        raise ValueError(f"No JSON object found in evaluator output: {text!r}")
-    return json.loads(match.group(0))
+        raise ValueError(f"No JSON object found in evaluator output: {_preview(text)!r}")
+    try:
+        return json.loads(match.group(0))
+    except json.JSONDecodeError as e:
+        # Most common cause: the response was cut off by max_tokens before
+        # the JSON closed, so the regex above grabbed a truncated object.
+        raise ValueError(f"Evaluator output was not valid JSON ({e}): {_preview(text)!r}") from e
 
 
 def _format_known_sources(state: AgentState) -> str:
@@ -187,7 +218,7 @@ def evaluate_evidence(state: AgentState) -> dict:
                 "Respond with ONLY the JSON object, nothing else.)"
             )
         try:
-            raw = llm.complete(attempt_prompt, system=EVALUATOR_SYSTEM_PROMPT, max_tokens=700)
+            raw = llm.complete(attempt_prompt, system=EVALUATOR_SYSTEM_PROMPT, max_tokens=EVALUATOR_MAX_TOKENS)
             result = _extract_json_object(raw)
             break
         except Exception as e:  # noqa: BLE001 — a broken evaluator must not kill the run

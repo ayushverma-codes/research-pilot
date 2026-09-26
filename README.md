@@ -1,15 +1,22 @@
-# ResearchPilot (Phase 3 — real tools + tool selection)
+# ResearchPilot (Phase 5 — structured report generation)
 
 An autonomous web research and report-generation agent. Phase 1 was a
 linear **PLAN → ACT → OBSERVE → UPDATE STATE → FINAL** pipeline. Phase 2
 added a genuine conditional loop: an LLM-driven evaluator decides, after
 each research pass, whether there's enough evidence to report or whether
-more research is needed. Phase 3 adds two more tools (a page reader and a
-report-file writer) and real **tool selection**: each plan step is now
+more research is needed. Phase 3 added two more tools (a page reader and
+a report-file writer) and real **tool selection**: each plan step is
 routed to the tool that fits its shape, instead of every step always
-going through web search. A full critic (source-relevance checks,
-structured issue list), memory, and evaluation are **not** implemented
-yet — they come in later phases.
+going through web search. Phase 4 extended the evaluator into a fuller
+**critic**: on top of the coverage check, it also flags quality issues
+(unsupported claims, irrelevant/off-topic sources) as structured
+`issues`/`recommended_action` output, surfaced (but not yet acted on
+beyond coverage) each pass. Phase 5 replaces the plain synthesized
+answer with a **structured, multi-section report** (Executive Summary,
+Research Question, Methodology, Key Findings, Comparison / Analysis,
+Limitations, Sources) — see "Report format" below. Persistent memory
+and a separate evaluation module are **not** implemented yet — they
+come in Phases 6 and 7.
 
 ## What it does right now
 
@@ -17,14 +24,16 @@ yet — they come in later phases.
 2. **Planner** (LLM) breaks it into 3–5 concrete research steps.
 3. **Researcher** executes each *pending* step, routing it to the tool
    that fits it (see "Tools" below), and records findings + sources.
-4. **Evaluator** (LLM) checks whether the findings so far are enough to
-   answer the goal. If not, it proposes 1–3 next actions — usually a new
-   search query, but it can also point at a specific source URL to read
-   in depth, or a calculation to run — and the plan is extended, routing
+4. **Evaluator / Critic** (LLM) checks whether the findings so far are
+   enough to answer the goal, *and* flags quality issues (unsupported
+   claims, off-topic sources) as structured `issues`. If coverage is
+   insufficient, it proposes 1–3 next actions — usually a new search
+   query, but it can also point at a specific source URL to read in
+   depth, or a calculation to run — and the plan is extended, routing
    back to the researcher. If sufficient (or the iteration cap is hit),
    it moves on.
-5. **Reporter** (LLM) synthesizes the findings into a final answer, with
-   sources listed.
+5. **Reporter** (LLM + deterministic assembly) synthesizes the findings
+   into a structured, multi-section report — see "Report format" below.
 6. The report is saved to `output/` via the **report writer** tool.
 
 ## Tools
@@ -78,6 +87,39 @@ evaluator in Phase 2 — it just expresses that decision as plain text
 to figure out *how to execute* whatever text it's given, which a few
 regexes do reliably and for free, keeping the loop explainable and fast.
 
+## Report format
+
+`app/reporter.py` assembles the final report from two sources, never just
+one:
+
+- **Deterministic sections** — built directly from `state`, so they can
+  never claim work that didn't happen: `Research Question` (the literal
+  `user_goal`), `Methodology` (iteration count, tool-call counts by type,
+  step count, and the critic's final `recommended_action`, all read from
+  `state.tool_history`/`state.iteration`/`state.critique`), and `Sources`
+  (every gathered source, de-duplicated by URL).
+- **LLM-written sections** — one reporter call returns exactly four
+  markdown sections (`Executive Summary`, `Key Findings`,
+  `Comparison / Analysis`, `Limitations`), which are parsed out by
+  heading and slotted into place. `Key Findings` is restricted to facts
+  actually present in `state.findings`; interpretation/synthesis is kept
+  separate in `Comparison / Analysis`, so facts and analysis are never
+  mixed in one block. The LLM's `Limitations` bullets are appended after
+  deterministic ones (any `state.missing_information` left over, and any
+  quality `issues` the critic raised) — so a run's real gaps are always
+  reported even if the LLM's own guess at limitations is thin.
+- If the LLM doesn't follow the requested heading format, its whole
+  reply is kept (as the Executive Summary) rather than silently dropped.
+- If a run gathered no findings/sources at all, that's stated explicitly
+  in `Limitations` rather than the report guessing at an answer.
+
+Final section order: `Executive Summary → Research Question →
+Methodology → Key Findings → Comparison / Analysis → Limitations →
+Sources`. `app/tools/report_writer.py` writes this already-complete
+report as-is (it only falls back to its old plain `# Research Report` /
+`**Goal:**` wrapper for a bare, unformatted body, kept for backward
+compatibility with earlier phases).
+
 ## Project structure
 
 ```
@@ -90,14 +132,16 @@ researchpilot/
 │   ├── planner.py
 │   ├── researcher.py     # NEW (Phase 3): routes each step to a tool via tool_selector
 │   ├── tool_selector.py  # NEW (Phase 3): decides web_search / page_reader / calculator
-│   ├── evaluator.py      # evidence check + routing decision (can now also
+│   ├── evaluator.py      # coverage + quality critic; routing decision (can
 │   │                     #   propose a URL to read, or a calculation)
-│   ├── reporter.py
+│   ├── reporter.py       # UPDATED (Phase 5): structured multi-section report
+│   │                     #   (see "Report format" above), not just a plain answer
 │   └── tools/
 │       ├── web_search.py
-│       ├── page_reader.py    # NEW (Phase 3): fetch + extract text from one URL
-│       ├── calculator.py     # now wired into the agent loop (was unused in Phase 2)
-│       └── report_writer.py  # NEW (Phase 3): save the final report to output/
+│       ├── page_reader.py    # fetch + extract text from one URL
+│       ├── calculator.py     # wired into the agent loop
+│       └── report_writer.py  # save the final report to output/ (backward-
+│                              #   compatible with a bare, unformatted body)
 ├── tests/
 ├── output/                # generated reports land here
 ├── .env.example
@@ -165,22 +209,61 @@ pip install pytest
 python -m pytest tests/ -v
 ```
 
-`tests/test_mvp.py` (Phase 1), `tests/test_phase2.py` (Phase 2), and
-`tests/test_phase3.py` (Phase 3, new) cover `AgentState`, all four tools
+`tests/test_mvp.py` (Phase 1), `tests/test_phase2.py` (Phase 2),
+`tests/test_phase3.py` (Phase 3), `tests/test_phase4.py` (Phase 4), and
+`tests/test_phase5.py` (Phase 5, new) cover `AgentState`, all four tools
 (`calculator`, `page_reader`, `report_writer`, and `web_search` indirectly
 via the researcher), JSON-extraction (planner + evaluator), the
-evaluator's routing decision and iteration cap, `tool_selector.choose_tool`
-for every step shape, and the researcher's dedup and tool-routing logic —
+evaluator/critic's routing decision, iteration cap, and quality-`issues`
+surfacing, `tool_selector.choose_tool` for every step shape, the
+researcher's dedup and tool-routing logic, and `generate_report`'s section
+parsing/assembly (order, deterministic Methodology/Sources/Research
+Question content, the no-findings and malformed-LLM-output fallbacks) —
 all without needing network access or an API key (`requests.get` /
-`web_search` / `read_page` are monkeypatched out wherever a test would
-otherwise need the network; `write_report` is exercised for real against a
-`tmp_path`, since it's a pure filesystem op that's safe to run anywhere).
-They do **not** cover live LLM calls or live web search themselves, since
-those need real credentials and open internet access; verify those
-manually with `python -m app.main "..."` (see "How this was tested"
-below).
+`web_search` / `read_page` / the LLM client are monkeypatched out
+wherever a test would otherwise need the network; `write_report` is
+exercised for real against a `tmp_path`, since it's a pure filesystem op
+that's safe to run anywhere). They do **not** cover live LLM calls or
+live web search themselves, since those need real credentials and open
+internet access; verify those manually with `python -m app.main "..."`
+(see "How this was tested" below).
 
 ## How this was tested
+
+### Phase 5
+
+The environment used to build Phase 5 has no network access (so
+`pip install -r requirements.txt` — `langgraph`, `pydantic`, etc. — could
+not run) and no LLM/API credentials. Given that, what was actually
+*executed* here:
+- `app/reporter.py`'s pure logic (`_split_sections`, `_build_methodology`,
+  `_build_limitations`, `_build_sources`) was run directly with a small
+  standalone harness (no `app.state`/pydantic dependency), covering
+  heading parsing, tool-count formatting, and URL de-duplication.
+- `tests/test_phase5.py` (7 new tests: section parsing with/without valid
+  headings, full `generate_report` assembly against a `FakeLLM` including
+  section order and deterministic-content checks, the no-findings case,
+  the malformed-LLM-output fallback, and both `write_report` behaviors —
+  passthrough for an already-formatted report and the old wrap-a-bare-body
+  path for backward compatibility) was executed against the real
+  `app/reporter.py` and `app/tools/report_writer.py` using minimal
+  same-shape shims for `pydantic.BaseModel`/`Field` and `dotenv` (since
+  those packages themselves aren't installable offline here) — **all 7
+  passed**. `tests/test_phase3.py`'s two existing `write_report` tests
+  were re-run the same way to confirm no regression — **both passed**.
+- A full sample report was rendered end-to-end (`generate_report` with a
+  scripted `FakeLLM`, real `Source`/`ToolCallRecord` objects) to eyeball
+  the actual output — section order, methodology numbers, and source
+  de-duplication all matched expectations.
+- **Not** run here: `python -m pytest tests/ -v` against the *real*
+  `pydantic`/`langgraph` install, `python -m py_compile`, and any live
+  `python -m app.main "..."` run. **Run these yourself** — with
+  `requirements.txt` installed and `.env` filled in — before treating
+  Phase 5 as fully validated; the shimmed tests prove `app/reporter.py`'s
+  logic is correct, not that it imports cleanly against the real
+  dependency versions pinned in `requirements.txt`.
+
+### Phase 3 (unchanged since)
 
 In the environment used to build this phase, `pip install -r
 requirements.txt pytest` succeeded and every check below was actually
@@ -219,7 +302,8 @@ requirements.txt pytest` succeeded and every check below was actually
 
 **You should still run a real `python -m app.main "..."` query on your
 own machine** (with `.env` filled in and open internet access) before
-treating Phase 3 as fully validated end-to-end — the mocked test proves
+treating Phase 3 (or Phase 5's report formatting on real output) as fully
+validated end-to-end — the mocked test proves
 the wiring is correct, not that DuckDuckGo's current HTML markup or a
 particular live page still parses as expected. A good test query is one
 that plausibly needs a calculation and a deeper look at one source, e.g.
@@ -228,12 +312,16 @@ compare to the free plan's limits?", so you can watch [TOOL] web_search,
 [TOOL] calculator, and potentially [TOOL] page_reader all fire in one
 run.
 
-## Known limitations (Phase 3 stage, expected)
+## Known limitations (Phase 5 stage, expected)
 
-- The evaluator is a lightweight sufficiency check, not the full Phase 4
-  critic — it doesn't verify that individual claims are source-supported,
-  check source relevance, or emit the structured
-  `sufficient/issues/recommended_action` schema. That's Phase 4.
+- The critic's quality `issues` (unsupported claims, off-topic sources)
+  are surfaced in the report's Limitations section, but don't otherwise
+  change agent behavior beyond what Phase 2's coverage check already
+  drove — the critic doesn't yet re-route research specifically to
+  resolve a quality issue that isn't also a coverage gap.
+- `Key Findings` vs `Comparison / Analysis` are only as well-separated as
+  the reporter LLM's instruction-following; the split is not verified
+  programmatically beyond "each came from its own requested heading".
 - If the evaluator's LLM call fails (bad JSON, API error), the code
   fails *open* — it assumes evidence is sufficient and moves to the
   reporter, rather than looping forever or crashing. This is a deliberate
@@ -248,6 +336,7 @@ run.
   fine for typical article/pricing pages and text-based PDFs, but it
   won't get useful text from a heavily JavaScript-rendered page or a
   scanned/image-only PDF with no text layer (no OCR).
-- Report formatting is plain text + a source list, not the full
-  multi-section report format (Phase 5).
-- No persistent memory across runs yet (Phase 6).
+- No persistent memory across runs yet (Phase 6) — no previous-topic
+  reuse, no learning from past successful/failed search patterns.
+- No separate evaluation module yet (Phase 7) — no deterministic
+  relevance/coverage/completeness scoring of a finished run.

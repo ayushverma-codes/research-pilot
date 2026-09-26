@@ -161,6 +161,44 @@ def test_evaluate_evidence_falls_back_after_two_failed_attempts(monkeypatch):
     assert "2 attempt" in update["critique"]["issues"][0]
 
 
+def test_evaluate_evidence_bounds_error_message_for_truncated_json(monkeypatch):
+    # Regression test for a live failure: a long response cut off by
+    # max_tokens before its JSON closed produced an error whose message
+    # embedded the model's *entire* raw reply verbatim (via repr), which
+    # then flowed into state.critique["issues"] and from there into the
+    # final report. The error message must stay short regardless of how
+    # long the truncated raw reply was.
+    long_truncated_json = (
+        '{\n  "sufficient": false,\n  "missing_information": [\n    "'
+        + ("very long detail that keeps going " * 50)
+        + '"\n  ]'
+        # deliberately no closing "}" - simulates a max_tokens cutoff
+    )
+
+    class TruncatedLLM:
+        def complete(self, prompt, system="", max_tokens=700):
+            return long_truncated_json
+
+    monkeypatch.setattr(evaluator_module, "get_llm_client", lambda: TruncatedLLM())
+
+    state = AgentState(user_goal="g", findings=["some finding"])
+    update = evaluate_evidence(state)
+
+    assert update["critique"]["sufficient"] is True
+    issue = update["critique"]["issues"][0]
+    assert len(issue) < 400  # bounded, not the ~1800-char raw reply
+    assert "\n" not in issue
+
+
+def test_evaluator_uses_a_generous_token_budget():
+    # The critic's JSON response can legitimately need more than a couple
+    # hundred tokens once it has several "issues" plus "missing_information"
+    # plus "additional_queries" to describe - 700 was observed live to be
+    # too tight and caused JSON truncation. Guard against silently
+    # shrinking this back down.
+    assert evaluator_module.EVALUATOR_MAX_TOKENS >= 1000
+
+
 if __name__ == "__main__":
     import pytest
     sys.exit(pytest.main([__file__, "-v"]))
