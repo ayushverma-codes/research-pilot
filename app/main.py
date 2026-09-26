@@ -9,13 +9,10 @@ Usage:
 from __future__ import annotations
 
 import sys
-from datetime import datetime
-from pathlib import Path
 
 from app.graph import build_graph
 from app.state import AgentState
-
-OUTPUT_DIR = Path(__file__).resolve().parent.parent / "output"
+from app.tools.report_writer import write_report
 
 
 def run(user_goal: str) -> AgentState:
@@ -23,17 +20,6 @@ def run(user_goal: str) -> AgentState:
     initial_state = AgentState(user_goal=user_goal)
     result = graph.invoke(initial_state)
     return AgentState(**result)
-
-
-def save_report(state: AgentState) -> Path:
-    OUTPUT_DIR.mkdir(exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = OUTPUT_DIR / f"report_{timestamp}.md"
-    path.write_text(
-        f"# Research Report\n\n**Goal:** {state.user_goal}\n\n{state.final_report}\n",
-        encoding="utf-8",
-    )
-    return path
 
 
 def main() -> None:
@@ -61,8 +47,9 @@ def main() -> None:
     print("\n=== FINAL REPORT ===\n")
     print(state.final_report)
 
-    path = save_report(state)
-    print(f"\n[SAVED] {path}")
+    print("[TOOL] report_writer")
+    path = write_report(state.user_goal, state.final_report)
+    print(f"[SAVED] {path}")
 
 
 if __name__ == "__main__":
