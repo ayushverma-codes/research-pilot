@@ -1,18 +1,31 @@
 """
-Evaluator node (Phase 2 — lightweight evidence check).
+Critic / evidence-check node (Phase 2 loop, extended in Phase 4).
 
-This is deliberately NOT the full Critic from Phase 4 (structured
-sufficient/issues/recommended_action schema with source-relevance checks).
-For Phase 2 it only has to answer one question well: given what's been
-found so far, is there enough evidence to answer the user's goal, and if
-not, what should be searched next? Phase 4 will replace/extend this with a
-fuller critic node.
+Phase 2 gave this node one job: given what's been found so far, is there
+enough evidence to answer the user's goal, and if not, what should be
+searched next? Phase 4 extends the same node into a fuller critic, asking
+the LLM to also check *quality*, not just coverage:
 
-This is the "Check evidence" + "Missing information?" decision point in:
+  - Is the requested information covered? (sufficient / missing_information
+    - unchanged from Phase 2)
+  - Are important claims actually backed by a source, or just asserted?
+  - Are the gathered sources relevant to the goal, or off-topic/noise?
+  - Is the research as a whole still on-topic?
 
-    Research -> Observe -> Check evidence -> Missing info?
-                                                ├─ Yes -> Research again
-                                                └─ No  -> continue
+These extra checks come back as "issues" (a list of specific problems)
+and "recommended_action" (a one-line statement of what to do about them),
+and are stored in `state.critique` each pass purely for
+visibility/logging/demo purposes - only `sufficient`/`missing_information`
+(via `additional_queries`) actually drive the routing decision, exactly as
+in Phase 2. Function/module names are kept as-is (`evaluate_evidence`,
+`app.evaluator`) rather than renamed to `critic.py`, so existing Phase
+2/3 tests keep working unchanged.
+
+This is the "Check evidence" / "Critic" + "Missing info?" decision point in:
+
+    Research -> Observe -> Critic / Evidence Check -> Enough evidence?
+                                                ├─ No  -> Research again
+                                                └─ Yes -> continue
 """
 
 from __future__ import annotations
@@ -28,19 +41,33 @@ from app.llm_provider import get_llm_client
 # forever. Configurable for experimentation, but always enforced.
 MAX_ITERATIONS = int(os.getenv("RESEARCHPILOT_MAX_ITERATIONS", "3"))
 
-EVALUATOR_SYSTEM_PROMPT = """You are a research evidence checker.
-Given a research goal and the findings gathered so far, decide whether
-there is enough evidence to write a good final answer.
+EVALUATOR_SYSTEM_PROMPT = """You are a research evidence checker (critic).
+Given a research goal and the findings gathered so far, judge the evidence
+on two dimensions:
+
+1. COVERAGE - is there enough evidence to write a good final answer?
+2. QUALITY - independent of coverage, are there problems with what has
+   been gathered:
+   - unsupported claims: something findings assert with no source behind it
+   - irrelevant/off-topic sources: a source that doesn't actually bear on
+     the goal
+   - the research drifting off-topic from the original goal
 
 Respond with ONLY a JSON object, nothing else, in this exact shape:
-{"sufficient": true or false, "missing_information": ["...", ...], "additional_queries": ["...", ...]}
+{"sufficient": true or false, "missing_information": ["...", ...], "issues": ["...", ...], "recommended_action": "...", "additional_queries": ["...", ...]}
 
 Rules:
-- "missing_information": short descriptions of what's still missing. Empty
-  list if sufficient.
+- "missing_information": short descriptions of what's still missing for
+  COVERAGE. Empty list if sufficient.
+- "issues": short descriptions of QUALITY problems (unsupported claims,
+  irrelevant sources, off-topic drift). Empty list if none found. A
+  finding can be sufficient for coverage and still have issues.
+- "recommended_action": one short sentence: either the single next action
+  to take (e.g. "Search official pricing page"), or, if nothing more is
+  needed, state that the evidence is sufficient and ready for the report.
 - "additional_queries": 1 to 3 concrete next actions that would fill the
-  gaps. Empty list if sufficient. Usually this is a new web search query,
-  but it can instead be:
+  coverage gaps or resolve the issues above. Empty list if sufficient.
+  Usually this is a new web search query, but it can instead be:
     - one of the exact URLs listed under "Known sources" below, copied
       character-for-character, if that source needs to be read in more
       depth than its search snippet gives you. NEVER construct, guess,
@@ -52,7 +79,9 @@ Rules:
       (e.g. a price difference) would help answer the goal.
 - Never propose an action that has already been run.
 - If the findings already reasonably cover the goal, set sufficient=true
-  even if not every minor detail is present.
+  even if not every minor detail is present. Quality "issues" alone
+  (without missing_information) do not force sufficient=false unless they
+  are serious enough that the report would make an unsupported claim.
 """
 
 URL_RE = re.compile(r"https?://\S+")
@@ -118,7 +147,13 @@ def evaluate_evidence(state: AgentState) -> dict:
 
     if iteration > MAX_ITERATIONS:
         print(f"[DECISION] Max iterations ({MAX_ITERATIONS}) reached — proceeding to report.")
-        return {"iteration": iteration, "missing_information": []}
+        critique = {
+            "sufficient": True,
+            "missing_information": [],
+            "issues": [],
+            "recommended_action": f"Max iterations ({MAX_ITERATIONS}) reached; proceeding to report as-is.",
+        }
+        return {"iteration": iteration, "missing_information": [], "critique": critique}
 
     llm = get_llm_client()
     findings_text = "\n\n".join(state.findings) if state.findings else "(no findings yet)"
@@ -134,15 +169,46 @@ def evaluate_evidence(state: AgentState) -> dict:
         "Is this enough evidence? Respond with the JSON object now."
     )
 
-    try:
-        raw = llm.complete(prompt, system=EVALUATOR_SYSTEM_PROMPT, max_tokens=700)
-        result = _extract_json_object(raw)
-    except Exception as e:  # noqa: BLE001 — a broken evaluator must not kill the run
-        print(f"[CRITIC] Evaluation failed ({e}) — assuming evidence is sufficient.")
-        return {"iteration": iteration, "missing_information": []}
+    # A critic call occasionally comes back empty or without valid JSON
+    # (observed live: an empty string from the LLM). That's usually a
+    # one-off blip, not a real "the model has an opinion" response, so
+    # retry once with a sharper reminder before treating it as a genuine
+    # evaluator failure. This intentionally mirrors GroqClient's own
+    # bounded-retry pattern in llm_provider.py rather than inventing a new
+    # retry style.
+    MAX_ATTEMPTS = 2
+    result = None
+    last_error: Exception | None = None
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        attempt_prompt = prompt
+        if attempt > 1:
+            attempt_prompt += (
+                "\n\n(Your previous reply was empty or was not valid JSON. "
+                "Respond with ONLY the JSON object, nothing else.)"
+            )
+        try:
+            raw = llm.complete(attempt_prompt, system=EVALUATOR_SYSTEM_PROMPT, max_tokens=700)
+            result = _extract_json_object(raw)
+            break
+        except Exception as e:  # noqa: BLE001 — a broken evaluator must not kill the run
+            last_error = e
+            if attempt < MAX_ATTEMPTS:
+                print(f"[CRITIC] Evaluation attempt {attempt} failed ({e}) — retrying once.")
+
+    if result is None:
+        print(f"[CRITIC] Evaluation failed after {MAX_ATTEMPTS} attempt(s) ({last_error}) — assuming evidence is sufficient.")
+        critique = {
+            "sufficient": True,
+            "missing_information": [],
+            "issues": [f"Critic evaluation itself failed after {MAX_ATTEMPTS} attempt(s): {last_error}"],
+            "recommended_action": "Evaluation failed; proceeding to report on existing findings.",
+        }
+        return {"iteration": iteration, "missing_information": [], "critique": critique}
 
     sufficient = bool(result.get("sufficient", True))
     missing = [str(m).strip() for m in result.get("missing_information", []) if str(m).strip()]
+    issues = [str(i).strip() for i in result.get("issues", []) if str(i).strip()]
+    recommended_action = str(result.get("recommended_action", "")).strip()
     new_queries = [str(q).strip() for q in result.get("additional_queries", []) if str(q).strip()]
 
     # Drop any proposed URL the LLM invented rather than copied from
@@ -154,9 +220,19 @@ def evaluate_evidence(state: AgentState) -> dict:
     already_known = set(state.plan) | set(state.completed_steps)
     new_queries = [q for q in new_queries if q not in already_known]
 
+    if issues:
+        print(f"[CRITIC] Quality issues noted: {issues}")
+
+    critique = {
+        "sufficient": sufficient or not new_queries,
+        "missing_information": missing,
+        "issues": issues,
+        "recommended_action": recommended_action,
+    }
+
     if sufficient or not new_queries:
         print("[CRITIC] Evidence sufficient — continuing to report.")
-        return {"iteration": iteration, "missing_information": []}
+        return {"iteration": iteration, "missing_information": [], "critique": critique}
 
     print(f"[CRITIC] Evidence incomplete: {missing}")
     print(f"[DECISION] Additional research required — queueing {len(new_queries)} new search(es): {new_queries}")
@@ -165,6 +241,7 @@ def evaluate_evidence(state: AgentState) -> dict:
         "iteration": iteration,
         "missing_information": missing,
         "plan": state.plan + new_queries,
+        "critique": critique,
     }
 
 
