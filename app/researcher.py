@@ -1,10 +1,15 @@
 """
 Researcher node.
 
-Executes every step in state.plan using the web_search tool (ACT), records
-what was returned (OBSERVE), and folds results into findings/sources/
-tool_history (UPDATE STATE). MVP is a single linear pass over the plan -
-no re-planning yet (that's Phase 2).
+Executes pending steps in state.plan using the web_search tool (ACT),
+records what was returned (OBSERVE), and folds results into findings/
+sources/tool_history (UPDATE STATE).
+
+Phase 2 change: the plan can now grow between passes (the evaluator node
+appends new queries when evidence is insufficient), and this node may run
+more than once per graph invocation. So it only processes steps that are
+not already in `completed_steps`, instead of assuming a single fixed pass
+over a static plan.
 """
 
 from __future__ import annotations
@@ -19,10 +24,14 @@ def research(state: AgentState) -> dict:
     tool_history = list(state.tool_history)
     completed_steps = list(state.completed_steps)
 
-    for step in state.plan:
+    pending_steps = [s for s in state.plan if s not in completed_steps]
+
+    for step in pending_steps:
+        print(f"[RESEARCH] Searching: {step}")
         try:
             results = web_search(step, max_results=3)
         except RuntimeError as e:
+            print(f"[TOOL] web_search failed: {e}")
             tool_history.append(
                 ToolCallRecord(tool="web_search", input=step, success=False, summary=str(e))
             )
@@ -31,6 +40,7 @@ def research(state: AgentState) -> dict:
             continue
 
         if not results:
+            print("[OBSERVE] 0 results found")
             tool_history.append(
                 ToolCallRecord(tool="web_search", input=step, success=True, summary="0 results")
             )
@@ -38,6 +48,7 @@ def research(state: AgentState) -> dict:
             completed_steps.append(step)
             continue
 
+        print(f"[OBSERVE] {len(results)} result(s) found")
         tool_history.append(
             ToolCallRecord(
                 tool="web_search",

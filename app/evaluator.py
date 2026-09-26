@@ -1,0 +1,116 @@
+"""
+Evaluator node (Phase 2 — lightweight evidence check).
+
+This is deliberately NOT the full Critic from Phase 4 (structured
+sufficient/issues/recommended_action schema with source-relevance checks).
+For Phase 2 it only has to answer one question well: given what's been
+found so far, is there enough evidence to answer the user's goal, and if
+not, what should be searched next? Phase 4 will replace/extend this with a
+fuller critic node.
+
+This is the "Check evidence" + "Missing information?" decision point in:
+
+    Research -> Observe -> Check evidence -> Missing info?
+                                                ├─ Yes -> Research again
+                                                └─ No  -> continue
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+
+from app.state import AgentState
+from app.llm_provider import get_llm_client
+
+# Hard ceiling on research loops, so a stubborn/ambiguous goal can never spin
+# forever. Configurable for experimentation, but always enforced.
+MAX_ITERATIONS = int(os.getenv("RESEARCHPILOT_MAX_ITERATIONS", "3"))
+
+EVALUATOR_SYSTEM_PROMPT = """You are a research evidence checker.
+Given a research goal and the findings gathered so far, decide whether
+there is enough evidence to write a good final answer.
+
+Respond with ONLY a JSON object, nothing else, in this exact shape:
+{"sufficient": true or false, "missing_information": ["...", ...], "additional_queries": ["...", ...]}
+
+Rules:
+- "missing_information": short descriptions of what's still missing. Empty
+  list if sufficient.
+- "additional_queries": 1 to 3 concrete new web search queries that would
+  fill the gaps. Empty list if sufficient.
+- Never propose a query that has already been searched.
+- If the findings already reasonably cover the goal, set sufficient=true
+  even if not every minor detail is present.
+"""
+
+
+def _extract_json_object(text: str) -> dict:
+    """Best-effort extraction of a JSON object from an LLM response."""
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        raise ValueError(f"No JSON object found in evaluator output: {text!r}")
+    return json.loads(match.group(0))
+
+
+def evaluate_evidence(state: AgentState) -> dict:
+    """
+    Decide whether current findings are enough to report, or whether another
+    research pass is needed. Returns a state update dict.
+
+    Contract with the router (`needs_more_research`, below): this function
+    only ever returns a non-empty `missing_information` when it is also
+    handing back new queries in `plan` for the researcher to act on. So the
+    router can make its decision by looking at `missing_information` alone.
+    """
+    iteration = state.iteration + 1
+
+    if iteration > MAX_ITERATIONS:
+        print(f"[DECISION] Max iterations ({MAX_ITERATIONS}) reached — proceeding to report.")
+        return {"iteration": iteration, "missing_information": []}
+
+    llm = get_llm_client()
+    findings_text = "\n\n".join(state.findings) if state.findings else "(no findings yet)"
+    already_searched = ", ".join(state.completed_steps) or "(none)"
+    prompt = (
+        f"Research goal: {state.user_goal}\n\n"
+        f"Already searched: {already_searched}\n\n"
+        f"Findings gathered:\n{findings_text}\n\n"
+        "Is this enough evidence? Respond with the JSON object now."
+    )
+
+    try:
+        raw = llm.complete(prompt, system=EVALUATOR_SYSTEM_PROMPT, max_tokens=700)
+        result = _extract_json_object(raw)
+    except Exception as e:  # noqa: BLE001 — a broken evaluator must not kill the run
+        print(f"[CRITIC] Evaluation failed ({e}) — assuming evidence is sufficient.")
+        return {"iteration": iteration, "missing_information": []}
+
+    sufficient = bool(result.get("sufficient", True))
+    missing = [str(m).strip() for m in result.get("missing_information", []) if str(m).strip()]
+    new_queries = [str(q).strip() for q in result.get("additional_queries", []) if str(q).strip()]
+
+    # Never re-queue a query that's already planned or already run.
+    already_known = set(state.plan) | set(state.completed_steps)
+    new_queries = [q for q in new_queries if q not in already_known]
+
+    if sufficient or not new_queries:
+        print("[CRITIC] Evidence sufficient — continuing to report.")
+        return {"iteration": iteration, "missing_information": []}
+
+    print(f"[CRITIC] Evidence incomplete: {missing}")
+    print(f"[DECISION] Additional research required — queueing {len(new_queries)} new search(es): {new_queries}")
+
+    return {
+        "iteration": iteration,
+        "missing_information": missing,
+        "plan": state.plan + new_queries,
+    }
+
+
+def needs_more_research(state: AgentState) -> str:
+    """Routing function for the conditional edge out of the evaluator node."""
+    if state.missing_information and state.iteration <= MAX_ITERATIONS:
+        return "researcher"
+    return "reporter"

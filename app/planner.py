@@ -45,4 +45,5 @@ def plan(state: AgentState) -> dict:
     if not steps:
         raise ValueError("Planner produced an empty plan.")
 
+    print(f"[PLAN] Created {len(steps)} research step(s): {steps}")
     return {"plan": steps, "current_step": 0}

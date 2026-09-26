@@ -54,9 +54,10 @@ def main() -> None:
         print(f"[ERROR] Agent run failed: {e}")
         sys.exit(1)
 
-    print(f"[PLAN] {len(state.plan)} step(s): {state.plan}")
-    print(f"[RESEARCH] {len(state.completed_steps)} step(s) completed, "
-          f"{len(state.sources)} source(s) gathered")
+    print(f"\n[SUMMARY] {len(state.plan)} total step(s) planned, "
+          f"{len(state.completed_steps)} completed, "
+          f"{len(state.sources)} source(s) gathered, "
+          f"{state.iteration} research iteration(s)")
     print("\n=== FINAL REPORT ===\n")
     print(state.final_report)
 

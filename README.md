@@ -1,25 +1,44 @@
-# ResearchPilot (MVP — Phase 1)
+# ResearchPilot (Phase 2 — real agentic loop)
 
-An autonomous web research and report-generation agent. This is the
-minimal, genuinely working slice of the project: a linear
-**PLAN → ACT → OBSERVE → UPDATE STATE → FINAL** pipeline. Conditional
-re-planning, a critic, richer tools, memory, and evaluation are **not**
-implemented yet — they come in later phases.
+An autonomous web research and report-generation agent. Phase 1 was a
+linear **PLAN → ACT → OBSERVE → UPDATE STATE → FINAL** pipeline. Phase 2
+replaces the fixed researcher→reporter step with a genuine conditional
+loop: an LLM-driven evaluator decides, after each research pass, whether
+there's enough evidence to report or whether more research is needed. A
+full critic (source-relevance checks, structured issue list), richer
+tools, memory, and evaluation are **not** implemented yet — they come in
+later phases.
 
 ## What it does right now
 
 1. You give it a research question via the CLI.
 2. **Planner** (LLM) breaks it into 3–5 concrete research steps.
-3. **Researcher** runs a real web search for each step (DuckDuckGo HTML
-   endpoint, no API key needed) and records findings + sources.
-4. **Reporter** (LLM) synthesizes the findings into a final answer, with
+3. **Researcher** runs a real web search for each *pending* step
+   (DuckDuckGo HTML endpoint, no API key needed) and records findings +
+   sources.
+4. **Evaluator** (LLM) checks whether the findings so far are enough to
+   answer the goal. If not, it proposes 1–3 new search queries and the
+   plan is extended — routing back to the researcher. If so (or the
+   iteration cap is hit), it moves on.
+5. **Reporter** (LLM) synthesizes the findings into a final answer, with
    sources listed, and saves it to `output/`.
 
-Orchestration is a linear LangGraph graph:
+Orchestration is a LangGraph graph with a conditional loop:
 
 ```
-START -> planner -> researcher -> reporter -> END
+                         ┌────────────────────────┐
+                         │                         │
+                         ▼                         │
+START -> planner -> researcher -> evaluator ───────┘  (evidence insufficient,
+                                       │                under iteration cap)
+                                       ▼
+                                   reporter -> END      (evidence sufficient,
+                                                          or cap hit)
 ```
+
+The evaluator — not a fixed sequence — decides which branch to take each
+time, based on current state (findings so far, what's already been
+searched, iteration count). See `app/evaluator.py`.
 
 ## Project structure
 
@@ -28,10 +47,11 @@ researchpilot/
 ├── app/
 │   ├── main.py          # CLI entrypoint
 │   ├── state.py         # shared Pydantic AgentState
-│   ├── llm_provider.py  # configurable LLM wrapper (Anthropic for now)
-│   ├── graph.py          # LangGraph wiring
+│   ├── llm_provider.py  # configurable LLM wrapper (Anthropic/Groq)
+│   ├── graph.py          # LangGraph wiring, incl. conditional loop
 │   ├── planner.py
-│   ├── researcher.py
+│   ├── researcher.py     # now dedups against completed_steps
+│   ├── evaluator.py      # NEW (Phase 2): evidence check + routing decision
 │   ├── reporter.py
 │   └── tools/
 │       ├── web_search.py
@@ -78,6 +98,7 @@ file under `output/`.
 | `GROQ_API_KEY` | Your Groq API key. Required when `LLM_PROVIDER=groq`. Never commit this. |
 | `GROQ_REQUESTS_PER_MINUTE` | Client-side throttle for Groq calls (default `25`). See "Rate limiting" below. |
 | `ANTHROPIC_API_KEY` | Your Anthropic API key. Only required when `LLM_PROVIDER=anthropic`. |
+| `RESEARCHPILOT_MAX_ITERATIONS` | Max research/evaluate loop iterations before forcing a report (default `3`). Prevents infinite loops. |
 
 ### Rate limiting (Groq)
 
@@ -102,45 +123,50 @@ pip install pytest
 python -m pytest tests/ -v
 ```
 
-The included tests cover `AgentState`, the calculator tool, and the
-planner's JSON-extraction logic — all without needing network access or an
-API key. They do **not** cover the LLM/web-search calls themselves, since
-those require live credentials and internet access; verify those manually
-with `python -m app.main "..."` (see "Known limitations / how this was
-tested" below).
+`tests/test_mvp.py` (Phase 1) and `tests/test_phase2.py` (Phase 2) cover
+`AgentState`, the calculator tool, JSON-extraction (planner + evaluator),
+the evaluator's routing decision and iteration cap, and the researcher's
+dedup-against-`completed_steps` logic — all without needing network access
+or an API key (network calls are monkeypatched out in the researcher
+tests). They do **not** cover live LLM/web-search calls themselves, since
+those require real credentials and internet access; verify those manually
+with `python -m app.main "..."` (see "How this was tested" below).
 
 ## How this was tested
 
-In the sandboxed environment used to build this MVP:
-- `pytest` suite (6 tests): **passed**.
-- `app.graph.build_graph()` compiles and produces the expected
-  `planner -> researcher -> reporter` graph (verified via
-  `get_graph().draw_mermaid()`).
-- Live web search: **could not be executed** in that sandbox because its
-  network egress only allowlists package registries (pypi, npm, github,
-  etc.), not general web hosts — a request to DuckDuckGo returned
-  `403 host_not_allowed` from the sandbox's own egress proxy, not from
-  DuckDuckGo. The code path is otherwise straightforward
-  `requests.post` + BeautifulSoup parsing.
-- Live LLM calls: **could not be executed** in that sandbox because no
-  `GROQ_API_KEY` (or `ANTHROPIC_API_KEY`) was available there. The
-  Groq client's misconfiguration path (missing key → clear `LLMError`) and
-  its retry-after parsing / rate-limiter logic **were** unit-tested without
-  a live key or network call.
+In the sandboxed environment used to build this phase:
+- Every file (Phase 1 + Phase 2) compiles cleanly (`python -m py_compile`).
+- The `pydantic`/`langgraph`/`pytest` packages are **not installed** in
+  this sandbox, and it has no network access to install them (`pip
+  install` fails with "No matching distribution found" — not a code
+  issue, an environment one). So the test suite and
+  `app.graph.build_graph()` could not actually be *executed* here; the
+  Phase 2 additions were verified by careful code review and syntax
+  checking instead.
+- Live web search and live LLM calls: **could not be executed** here
+  either, for the same reason noted in the Phase 1 section below (no
+  general internet egress, no API key configured in this sandbox).
 
-**You should verify both of these on your own machine** (normal internet
-access + your own API key) before treating the MVP as fully validated
-end-to-end. Nothing above is a code bug — it's a sandbox network/credential
-limitation, disclosed here rather than hidden.
+**You should run `pip install -r requirements.txt pytest`, then
+`python -m pytest tests/ -v`, then a real `python -m app.main "..."` query
+on your own machine** before treating Phase 2 as fully validated
+end-to-end. A good test query is one with an intentionally incomplete
+first search topic, so you can watch the evaluator trigger a second
+iteration (e.g. a "current pricing" question, where the first search may
+miss the official source).
 
-## Known limitations (MVP stage, expected)
+## Known limitations (Phase 2 stage, expected)
 
-- No conditional re-planning yet — the plan runs once, straight through,
-  regardless of how good the findings are (Phase 2).
-- No critic / evidence-sufficiency check yet (Phase 4).
-- Web search uses a no-key DuckDuckGo HTML scrape — fine for an MVP, but
-  more fragile than a paid search API and can be rate-limited or blocked by
-  DuckDuckGo itself in some environments.
+- The evaluator is a lightweight sufficiency check, not the full Phase 4
+  critic — it doesn't verify that individual claims are source-supported,
+  check source relevance, or emit the structured
+  `sufficient/issues/recommended_action` schema. That's Phase 4.
+- If the evaluator's LLM call fails (bad JSON, API error), the code
+  fails *open* — it assumes evidence is sufficient and moves to the
+  reporter, rather than looping forever or crashing. This is a deliberate
+  simplicity/robustness tradeoff for this phase.
+- Web search still uses a no-key DuckDuckGo HTML scrape — fine for this
+  stage, but more fragile than a paid search API.
 - The calculator tool exists and is unit-tested but is not yet called by
   the agent loop (that wiring comes in Phase 3, when tool selection is
   added).

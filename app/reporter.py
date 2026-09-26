@@ -30,7 +30,7 @@ def generate_report(state: AgentState) -> dict:
         "Write the final answer now."
     )
 
-    answer = llm.complete(prompt, system=REPORTER_SYSTEM_PROMPT, max_tokens=1200)
+    answer = llm.complete(prompt, system=REPORTER_SYSTEM_PROMPT, max_tokens=2000)
 
     sources_text = "\n".join(f"- {s.title} ({s.url})" for s in state.sources) or "(no sources)"
     report = f"{answer}\n\n---\nSources:\n{sources_text}"
