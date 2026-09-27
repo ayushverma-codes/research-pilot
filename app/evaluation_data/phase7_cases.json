@@ -1,0 +1,71 @@
+[
+  {
+    "id": "simple_factual",
+    "category": "simple factual research",
+    "allowed_iterations": 3,
+    "run": {
+      "user_goal": "What is Python and who maintains it?",
+      "findings": [
+        "Step 'Python language official overview': Python is a programming language. Python.org documentation is maintained by the Python community and Python Software Foundation resources describe the project."
+      ],
+      "sources": [
+        {"url": "https://www.python.org/about/", "title": "About Python", "snippet": "Python is a programming language with community-maintained resources."}
+      ],
+      "iteration": 1,
+      "final_report": "# Research Report\n\n## Executive Summary\nPython is a programming language supported by its community and the Python Software Foundation.\n\n## Research Question\nWhat is Python and who maintains it?\n\n## Methodology\nReviewed an official Python source.\n\n## Key Findings\n- Python is a programming language.\n- Python resources are maintained by the Python community and Python Software Foundation.\n\n## Comparison / Analysis\nThe official source directly addresses the factual task.\n\n## Limitations\n- This fixture uses one source.\n\n## Sources\n- About Python (https://www.python.org/about/)\n"
+    }
+  },
+  {
+    "id": "multi_entity_comparison",
+    "category": "multi-entity comparison",
+    "allowed_iterations": 3,
+    "run": {
+      "user_goal": "Compare PostgreSQL and MySQL for JSON support and licensing.",
+      "findings": [
+        "Step 'PostgreSQL JSON licensing': PostgreSQL supports JSON and JSONB. PostgreSQL uses the PostgreSQL License.",
+        "Step 'MySQL JSON licensing': MySQL supports a native JSON data type. MySQL Community Edition is available under GPL licensing."
+      ],
+      "sources": [
+        {"url": "https://www.postgresql.org/docs/current/datatype-json.html", "title": "PostgreSQL JSON Types", "snippet": "PostgreSQL supports JSON and JSONB data types."},
+        {"url": "https://www.mysql.com/about/legal/licensing/oem/", "title": "MySQL Licensing", "snippet": "MySQL Community Edition is distributed under the GPL."}
+      ],
+      "iteration": 2,
+      "final_report": "# Research Report\n\n## Executive Summary\nPostgreSQL and MySQL both provide JSON capabilities but differ in JSON implementation details and licensing.\n\n## Research Question\nCompare PostgreSQL and MySQL for JSON support and licensing.\n\n## Methodology\nCompared collected PostgreSQL and MySQL sources.\n\n## Key Findings\n- PostgreSQL supports JSON and JSONB.\n- PostgreSQL uses the PostgreSQL License.\n- MySQL supports a native JSON data type.\n- MySQL Community Edition is available under GPL licensing.\n\n## Comparison / Analysis\nBoth systems support JSON; the gathered evidence also records different licensing terms.\n\n## Limitations\n- Performance was outside this task.\n\n## Sources\n- PostgreSQL JSON Types (https://www.postgresql.org/docs/current/datatype-json.html)\n- MySQL Licensing (https://www.mysql.com/about/legal/licensing/oem/)\n"
+    }
+  },
+  {
+    "id": "additional_research",
+    "category": "task requiring additional research",
+    "allowed_iterations": 3,
+    "run": {
+      "user_goal": "Compare ExampleCloud Basic and Pro pricing and calculate the annual difference.",
+      "findings": [
+        "Step 'ExampleCloud pricing': Basic costs $10 per month and Pro costs $20 per month.",
+        "Step 'Calculate: (20 - 10) * 12': result = 120"
+      ],
+      "sources": [
+        {"url": "https://example.com/pricing", "title": "ExampleCloud Pricing", "snippet": "Basic costs $10 per month. Pro costs $20 per month."}
+      ],
+      "iteration": 2,
+      "final_report": "# Research Report\n\n## Executive Summary\nExampleCloud Pro costs $10 more per month than Basic, a $120 annual difference.\n\n## Research Question\nCompare ExampleCloud Basic and Pro pricing and calculate the annual difference.\n\n## Methodology\nUsed pricing evidence and a calculator step over two research iterations.\n\n## Key Findings\n- Basic costs $10 per month.\n- Pro costs $20 per month.\n- The annual price difference is $120.\n\n## Comparison / Analysis\nPro is $10 more per month, which produces a $120 annual difference.\n\n## Limitations\n- Taxes and discounts were not evaluated.\n\n## Sources\n- ExampleCloud Pricing (https://example.com/pricing)\n"
+    }
+  },
+  {
+    "id": "limited_evidence",
+    "category": "incomplete / limited evidence",
+    "allowed_iterations": 3,
+    "run": {
+      "user_goal": "Compare Alpha and Beta on price, reliability, and enterprise support.",
+      "findings": [
+        "Step 'Alpha price': Alpha pricing was found, but Beta pricing and reliability/support evidence were not found."
+      ],
+      "sources": [
+        {"url": "https://alpha.example/pricing", "title": "Alpha Pricing", "snippet": "Alpha starts at $15 per month."}
+      ],
+      "missing_information": ["Beta pricing", "reliability evidence", "enterprise support evidence"],
+      "iteration": 3,
+      "critique": {"sufficient": true, "issues": ["Evidence remains incomplete."], "recommended_action": "Max iterations reached; report limitations."},
+      "final_report": "# Research Report\n\n## Executive Summary\nThe gathered evidence is insufficient for a full Alpha-versus-Beta comparison.\n\n## Research Question\nCompare Alpha and Beta on price, reliability, and enterprise support.\n\n## Methodology\nResearch stopped at the configured iteration limit.\n\n## Key Findings\n- Alpha starts at $15 per month.\n\n## Comparison / Analysis\nA reliable comparison cannot be completed from the gathered evidence.\n\n## Limitations\n- Beta pricing was not found.\n- Reliability evidence was not found.\n- Enterprise support evidence was not found.\n\n## Sources\n- Alpha Pricing (https://alpha.example/pricing)\n"
+    }
+  }
+]

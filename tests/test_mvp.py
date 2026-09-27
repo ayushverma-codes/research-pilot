@@ -102,3 +102,37 @@ def test_groq_client_falls_back_to_default_when_no_header():
 if __name__ == "__main__":
     import pytest
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_llm_timeout_defaults_and_validates(monkeypatch):
+    from app.llm_provider import _llm_timeout_seconds, LLMError
+    import pytest
+
+    monkeypatch.delenv("LLM_TIMEOUT_SECONDS", raising=False)
+    assert _llm_timeout_seconds() == 60.0
+
+    monkeypatch.setenv("LLM_TIMEOUT_SECONDS", "12.5")
+    assert _llm_timeout_seconds() == 12.5
+
+    monkeypatch.setenv("LLM_TIMEOUT_SECONDS", "0")
+    with pytest.raises(LLMError):
+        _llm_timeout_seconds()
+
+    monkeypatch.setenv("LLM_TIMEOUT_SECONDS", "not-a-number")
+    with pytest.raises(LLMError):
+        _llm_timeout_seconds()
+
+
+def test_hard_llm_timeout_returns_control_quickly():
+    import time
+    import pytest
+    from app.llm_provider import _run_with_hard_timeout, LLMError
+
+    def stuck_call():
+        time.sleep(0.5)
+        return "late"
+
+    started = time.monotonic()
+    with pytest.raises(LLMError, match="hard timeout"):
+        _run_with_hard_timeout(stuck_call, 0.05)
+    assert time.monotonic() - started < 0.3

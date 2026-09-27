@@ -101,7 +101,7 @@ def test_critique_present_when_llm_output_unparsable(monkeypatch):
     update = evaluate_evidence(state)
 
     assert update["missing_information"] == []
-    assert update["critique"]["sufficient"] is True
+    assert update["critique"]["sufficient"] is False
     assert update["critique"]["issues"]  # the failure itself is recorded as an issue
 
 
@@ -157,7 +157,7 @@ def test_evaluate_evidence_falls_back_after_two_failed_attempts(monkeypatch):
     update = evaluate_evidence(state)
 
     assert len(calls) == 2  # both attempts were used, not just one
-    assert update["critique"]["sufficient"] is True
+    assert update["critique"]["sufficient"] is False
     assert "2 attempt" in update["critique"]["issues"][0]
 
 
@@ -184,21 +184,167 @@ def test_evaluate_evidence_bounds_error_message_for_truncated_json(monkeypatch):
     state = AgentState(user_goal="g", findings=["some finding"])
     update = evaluate_evidence(state)
 
-    assert update["critique"]["sufficient"] is True
+    assert update["critique"]["sufficient"] is False
     issue = update["critique"]["issues"][0]
     assert len(issue) < 400  # bounded, not the ~1800-char raw reply
     assert "\n" not in issue
 
 
-def test_evaluator_uses_a_generous_token_budget():
-    # The critic's JSON response can legitimately need more than a couple
-    # hundred tokens once it has several "issues" plus "missing_information"
-    # plus "additional_queries" to describe - 700 was observed live to be
-    # too tight and caused JSON truncation. Guard against silently
-    # shrinking this back down.
-    assert evaluator_module.EVALUATOR_MAX_TOKENS >= 1000
+def test_evaluator_uses_a_bounded_json_token_budget():
+    # The critic only emits a small JSON object. Keep enough headroom to avoid
+    # truncation while preventing later evidence checks from requesting an
+    # unnecessarily large generation.
+    assert 700 <= evaluator_module.EVALUATOR_MAX_TOKENS <= 1000
 
 
 if __name__ == "__main__":
     import pytest
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_critic_compacts_large_findings_prompt(monkeypatch):
+    seen_prompts = []
+
+    class InspectingLLM:
+        def complete(self, prompt, system="", max_tokens=700):
+            seen_prompts.append(prompt)
+            return json.dumps({
+                "sufficient": True,
+                "missing_information": [],
+                "issues": [],
+                "recommended_action": "Proceed to report.",
+                "additional_queries": [],
+            })
+
+    monkeypatch.setattr(evaluator_module, "get_llm_client", lambda: InspectingLLM())
+    state = AgentState(user_goal="g", findings=["x" * 5000 for _ in range(10)])
+    update = evaluate_evidence(state)
+
+    assert update["critique"]["sufficient"] is True
+    assert len(seen_prompts) == 1
+    assert len(seen_prompts[0]) < evaluator_module.EVALUATOR_MAX_FINDINGS_CHARS + 2000
+    assert "Earlier findings omitted" in seen_prompts[0]
+
+
+def test_evaluator_timeout_queues_one_deeper_source_pass_without_second_wait(monkeypatch):
+    import time
+
+    class StuckLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def complete(self, prompt, system="", max_tokens=700):
+            self.calls += 1
+            time.sleep(0.5)
+            return "{}"
+
+    stuck = StuckLLM()
+    monkeypatch.setattr(evaluator_module, "get_llm_client", lambda: stuck)
+    monkeypatch.setattr(evaluator_module, "EVALUATOR_CALL_TIMEOUT_SECONDS", 0.05)
+
+    state = AgentState(
+        user_goal="What does X cost?",
+        findings=["some finding"],
+        sources=[Source(url="https://example.com/pricing", title="X pricing")],
+    )
+    started = time.monotonic()
+    update = evaluate_evidence(state)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.3
+    assert stuck.calls == 1
+    assert update["missing_information"]
+    assert update["critique"]["sufficient"] is False
+    assert "https://example.com/pricing" in update["plan"]
+    assert "1 attempt" in update["critique"]["issues"][0]
+
+
+def test_evaluator_second_timeout_stops_after_bounded_recovery(monkeypatch):
+    import time
+
+    class StuckLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def complete(self, prompt, system="", max_tokens=700):
+            self.calls += 1
+            time.sleep(0.5)
+            return "{}"
+
+    stuck = StuckLLM()
+    monkeypatch.setattr(evaluator_module, "get_llm_client", lambda: stuck)
+    monkeypatch.setattr(evaluator_module, "EVALUATOR_CALL_TIMEOUT_SECONDS", 0.05)
+
+    # iteration=1 means this is the critic pass after the one-shot recovery.
+    state = AgentState(
+        user_goal="What does X cost?",
+        iteration=1,
+        findings=["detailed page finding"],
+        sources=[Source(url="https://example.com/pricing", title="X pricing")],
+        completed_steps=["https://example.com/pricing"],
+    )
+    update = evaluate_evidence(state)
+
+    assert stuck.calls == 1
+    assert update["missing_information"] == []
+    assert update["critique"]["sufficient"] is False
+    assert "could not be confirmed" in update["critique"]["issues"][-1].lower()
+    assert "plan" not in update
+
+
+def test_timeout_recovery_can_read_source_then_reach_sufficient_critic(monkeypatch):
+    from app.researcher import research
+    import app.researcher as researcher_module
+    from app.tools.page_reader import PageContent
+
+    # Start from the state that exists after the initial searches: a relevant
+    # URL is known, but only snippet-level evidence has been gathered.
+    state = AgentState(
+        user_goal="What does X cost?",
+        plan=["search X pricing"],
+        completed_steps=["search X pricing"],
+        findings=["Search result says the official pricing page exists."],
+        sources=[Source(url="https://example.com/pricing", title="Official X pricing", snippet="Pricing")],
+    )
+
+    class StuckLLM:
+        def complete(self, prompt, system="", max_tokens=700):
+            time.sleep(0.2)
+            return "{}"
+
+    import time
+    monkeypatch.setattr(evaluator_module, "get_llm_client", lambda: StuckLLM())
+    monkeypatch.setattr(evaluator_module, "EVALUATOR_CALL_TIMEOUT_SECONDS", 0.02)
+    first_update = evaluate_evidence(state)
+    state = state.model_copy(update=first_update)
+
+    assert evaluator_module.needs_more_research(state) == "researcher"
+    assert "https://example.com/pricing" in state.plan
+
+    monkeypatch.setattr(
+        researcher_module,
+        "read_page",
+        lambda url: PageContent(url=url, title="Official X pricing", text="X costs $10 per month."),
+    )
+    research_update = research(state)
+    state = state.model_copy(update=research_update)
+    assert state.tool_history[-1].tool == "page_reader"
+
+    class GoodLLM:
+        def complete(self, prompt, system="", max_tokens=700):
+            return json.dumps({
+                "sufficient": True,
+                "missing_information": [],
+                "issues": [],
+                "recommended_action": "Evidence is sufficient and ready for the report.",
+                "additional_queries": [],
+            })
+
+    monkeypatch.setattr(evaluator_module, "get_llm_client", lambda: GoodLLM())
+    monkeypatch.setattr(evaluator_module, "_run_with_hard_timeout", lambda call, timeout: call())
+    second_update = evaluate_evidence(state)
+    state = state.model_copy(update=second_update)
+
+    assert state.iteration == 2
+    assert state.critique["sufficient"] is True
+    assert evaluator_module.needs_more_research(state) == "reporter"

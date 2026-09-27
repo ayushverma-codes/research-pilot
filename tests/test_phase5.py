@@ -140,17 +140,35 @@ def test_generate_report_states_insufficiency_when_no_findings(monkeypatch):
 
 
 def test_generate_report_falls_back_when_llm_ignores_format(monkeypatch):
-    # If the LLM doesn't use the requested headings, its whole reply
-    # should still show up (as the executive summary) instead of being
-    # silently dropped.
+    # A malformed/plain-text response must be treated as synthesis failure.
+    # The deterministic fallback should preserve gathered evidence instead
+    # of emitting empty report sections.
     monkeypatch.setattr(reporter_module, "get_llm_client", lambda: FakeLLM("Just a plain unstructured answer."))
 
     state = AgentState(user_goal="g", findings=["some finding"])
     update = generate_report(state)
     report = update["final_report"]
 
-    assert "Just a plain unstructured answer." in report
-    assert "(no findings gathered)" in report  # Key Findings section fallback
+    assert "some finding" in report
+    assert "(no findings gathered)" not in report
+    assert "Final report synthesis unavailable" in report
+
+
+def test_generate_report_empty_llm_output_preserves_gathered_findings(monkeypatch):
+    monkeypatch.setattr(reporter_module, "get_llm_client", lambda: FakeLLM(""))
+
+    state = AgentState(
+        user_goal="What does X cost?",
+        findings=["Official pricing page says X costs $10/month."],
+        sources=[Source(url="https://x.com/pricing", title="X Pricing")],
+    )
+
+    report = generate_report(state)["final_report"]
+
+    assert "Official pricing page says X costs $10/month." in report
+    assert "(no summary generated)" not in report
+    assert "(no findings gathered)" not in report
+    assert "Final report synthesis unavailable" in report
 
 
 # ---------------------------------------------------------------------------
@@ -229,3 +247,111 @@ def test_generate_report_sanitizes_messy_critique_issue(monkeypatch):
 if __name__ == "__main__":
     import pytest
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_generate_report_hard_timeout_uses_deterministic_fallback(monkeypatch):
+    import time
+
+    class SlowLLM:
+        def complete(self, prompt, system="", max_tokens=2000):
+            time.sleep(0.20)
+            return GOOD_SECTIONS
+
+    monkeypatch.setattr(reporter_module, "get_llm_client", lambda: SlowLLM())
+    monkeypatch.setattr(reporter_module, "REPORTER_CALL_TIMEOUT_SECONDS", 0.02)
+
+    state = AgentState(
+        user_goal="What does X cost?",
+        findings=["Official pricing page says X costs $10/month."],
+        sources=[Source(url="https://x.com/pricing", title="X Pricing")],
+    )
+
+    started = time.monotonic()
+    report = generate_report(state)["final_report"]
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.15
+    assert "final narrative synthesis could not be completed" in report
+    assert "Official pricing page says X costs $10/month." in report
+    assert "Final report synthesis unavailable" in report
+    assert "https://x.com/pricing" in report
+
+
+def test_generate_report_uses_bounded_prompt_and_token_budget(monkeypatch):
+    calls = {}
+
+    class RecordingLLM:
+        def complete(self, prompt, system="", max_tokens=2000):
+            calls["prompt"] = prompt
+            calls["max_tokens"] = max_tokens
+            return GOOD_SECTIONS
+
+    monkeypatch.setattr(reporter_module, "get_llm_client", lambda: RecordingLLM())
+    monkeypatch.setattr(reporter_module, "REPORTER_CALL_TIMEOUT_SECONDS", 1.0)
+
+    state = AgentState(
+        user_goal="Summarize the evidence",
+        findings=["x" * 5000, "y" * 5000, "z" * 5000],
+    )
+    generate_report(state)
+
+    assert calls["max_tokens"] == reporter_module.REPORTER_MAX_TOKENS
+    assert len(calls["prompt"]) <= reporter_module.REPORTER_MAX_FINDINGS_CHARS + 500
+
+
+def test_generate_report_skips_synthesis_when_critic_did_not_confirm_sufficiency(monkeypatch):
+    class ShouldNotBeCalledLLM:
+        def complete(self, prompt, system="", max_tokens=2000):
+            raise AssertionError("reporter LLM must not be called when critic sufficiency is false")
+
+    monkeypatch.setattr(reporter_module, "get_llm_client", lambda: ShouldNotBeCalledLLM())
+
+    state = AgentState(
+        user_goal="What is the current price of X?",
+        findings=["Step 'official pricing': Official page snippet: X costs $10/month."],
+        sources=[Source(url="https://x.example/pricing", title="Official pricing")],
+        critique={
+            "sufficient": False,
+            "missing_information": [],
+            "issues": ["Evidence sufficiency could not be confirmed."],
+            "recommended_action": "Report only the evidence actually gathered.",
+        },
+    )
+
+    report = generate_report(state)["final_report"]
+
+    assert "Official page snippet: X costs $10/month." in report
+    assert "Evidence sufficiency unconfirmed" in report or "did not confirm evidence sufficiency" in report
+    assert "https://x.example/pricing" in report
+
+
+def test_unconfirmed_critic_cannot_promote_unsupported_reporter_claims(monkeypatch):
+    hallucinated = (
+        "## Executive Summary\nThe newest model is Imaginary 9 at $99/token.\n\n"
+        "## Key Findings\n- Imaginary 9 costs $99/token.\n\n"
+        "## Comparison / Analysis\nIt is cheapest.\n\n"
+        "## Limitations\nNone."
+    )
+
+    class HallucinatingLLM:
+        def complete(self, prompt, system="", max_tokens=2000):
+            return hallucinated
+
+    monkeypatch.setattr(reporter_module, "get_llm_client", lambda: HallucinatingLLM())
+
+    state = AgentState(
+        user_goal="What is current pricing?",
+        findings=["Step 'search': Official pricing page was found, but exact model prices were not extracted."],
+        critique={
+            "sufficient": False,
+            "missing_information": [],
+            "issues": ["Critic unavailable."],
+            "recommended_action": "Report only gathered evidence.",
+        },
+    )
+
+    report = generate_report(state)["final_report"]
+
+    assert "Imaginary 9" not in report
+    assert "$99/token" not in report
+    assert "exact model prices were not extracted" in report

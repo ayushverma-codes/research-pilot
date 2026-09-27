@@ -1,0 +1,306 @@
+{
+  "suite": "phase7_deterministic_fixture_suite",
+  "generated_at": "2026-09-27T11:28:48.288252+00:00",
+  "case_count": 4,
+  "aggregate": {
+    "relevance": 1.0,
+    "completeness": 0.9583,
+    "source_coverage": 1.0,
+    "grounding": 0.9167,
+    "format_quality": 1.0,
+    "overall": 0.975
+  },
+  "cases": [
+    {
+      "id": "simple_factual",
+      "category": "simple factual research",
+      "task": "What is Python and who maintains it?",
+      "result": {
+        "relevance": 1.0,
+        "completeness": 1.0,
+        "source_coverage": 1.0,
+        "grounding": 1.0,
+        "format_quality": 1.0,
+        "overall": 1.0,
+        "checks": {
+          "relevance": {
+            "goal_terms": [
+              "maintains",
+              "python",
+              "who"
+            ],
+            "matched_goal_terms": [
+              "maintains",
+              "python",
+              "who"
+            ]
+          },
+          "completeness": {
+            "findings_present": true,
+            "sources_present": true,
+            "executive_summary_present": true,
+            "limitations_present": true,
+            "no_unresolved_missing_information": true,
+            "terminated_within_iteration_limit": true
+          },
+          "source_coverage": {
+            "collected_urls": [
+              "https://www.python.org/about"
+            ],
+            "cited_urls": [
+              "https://www.python.org/about"
+            ],
+            "matched_urls": [
+              "https://www.python.org/about"
+            ],
+            "unknown_cited_urls": [],
+            "uncited_collected_urls": []
+          },
+          "grounding": {
+            "claims_considered": 2,
+            "supported_claims": 2,
+            "unsupported_claims": [],
+            "method": "key-finding lexical overlap >= 0.50 against findings/source metadata"
+          },
+          "format_quality": {
+            "required_sections": {
+              "Executive Summary": true,
+              "Research Question": true,
+              "Methodology": true,
+              "Key Findings": true,
+              "Comparison / Analysis": true,
+              "Limitations": true,
+              "Sources": true
+            }
+          }
+        },
+        "warnings": []
+      }
+    },
+    {
+      "id": "multi_entity_comparison",
+      "category": "multi-entity comparison",
+      "task": "Compare PostgreSQL and MySQL for JSON support and licensing.",
+      "result": {
+        "relevance": 1.0,
+        "completeness": 1.0,
+        "source_coverage": 1.0,
+        "grounding": 1.0,
+        "format_quality": 1.0,
+        "overall": 1.0,
+        "checks": {
+          "relevance": {
+            "goal_terms": [
+              "json",
+              "licensing.",
+              "mysql",
+              "postgresql",
+              "support"
+            ],
+            "matched_goal_terms": [
+              "json",
+              "licensing.",
+              "mysql",
+              "postgresql",
+              "support"
+            ]
+          },
+          "completeness": {
+            "findings_present": true,
+            "sources_present": true,
+            "executive_summary_present": true,
+            "limitations_present": true,
+            "no_unresolved_missing_information": true,
+            "terminated_within_iteration_limit": true
+          },
+          "source_coverage": {
+            "collected_urls": [
+              "https://www.mysql.com/about/legal/licensing/oem",
+              "https://www.postgresql.org/docs/current/datatype-json.html"
+            ],
+            "cited_urls": [
+              "https://www.mysql.com/about/legal/licensing/oem",
+              "https://www.postgresql.org/docs/current/datatype-json.html"
+            ],
+            "matched_urls": [
+              "https://www.mysql.com/about/legal/licensing/oem",
+              "https://www.postgresql.org/docs/current/datatype-json.html"
+            ],
+            "unknown_cited_urls": [],
+            "uncited_collected_urls": []
+          },
+          "grounding": {
+            "claims_considered": 4,
+            "supported_claims": 4,
+            "unsupported_claims": [],
+            "method": "key-finding lexical overlap >= 0.50 against findings/source metadata"
+          },
+          "format_quality": {
+            "required_sections": {
+              "Executive Summary": true,
+              "Research Question": true,
+              "Methodology": true,
+              "Key Findings": true,
+              "Comparison / Analysis": true,
+              "Limitations": true,
+              "Sources": true
+            }
+          }
+        },
+        "warnings": []
+      }
+    },
+    {
+      "id": "additional_research",
+      "category": "task requiring additional research",
+      "task": "Compare ExampleCloud Basic and Pro pricing and calculate the annual difference.",
+      "result": {
+        "relevance": 1.0,
+        "completeness": 1.0,
+        "source_coverage": 1.0,
+        "grounding": 0.6667,
+        "format_quality": 1.0,
+        "overall": 0.9333,
+        "checks": {
+          "relevance": {
+            "goal_terms": [
+              "annual",
+              "basic",
+              "calculate",
+              "difference.",
+              "examplecloud",
+              "pricing",
+              "pro"
+            ],
+            "matched_goal_terms": [
+              "annual",
+              "basic",
+              "calculate",
+              "difference.",
+              "examplecloud",
+              "pricing",
+              "pro"
+            ]
+          },
+          "completeness": {
+            "findings_present": true,
+            "sources_present": true,
+            "executive_summary_present": true,
+            "limitations_present": true,
+            "no_unresolved_missing_information": true,
+            "terminated_within_iteration_limit": true
+          },
+          "source_coverage": {
+            "collected_urls": [
+              "https://example.com/pricing"
+            ],
+            "cited_urls": [
+              "https://example.com/pricing"
+            ],
+            "matched_urls": [
+              "https://example.com/pricing"
+            ],
+            "unknown_cited_urls": [],
+            "uncited_collected_urls": []
+          },
+          "grounding": {
+            "claims_considered": 3,
+            "supported_claims": 2,
+            "unsupported_claims": [
+              "The annual price difference is $120."
+            ],
+            "method": "key-finding lexical overlap >= 0.50 against findings/source metadata"
+          },
+          "format_quality": {
+            "required_sections": {
+              "Executive Summary": true,
+              "Research Question": true,
+              "Methodology": true,
+              "Key Findings": true,
+              "Comparison / Analysis": true,
+              "Limitations": true,
+              "Sources": true
+            }
+          }
+        },
+        "warnings": [
+          "1 key-finding claim(s) had weak lexical support in gathered evidence."
+        ]
+      }
+    },
+    {
+      "id": "limited_evidence",
+      "category": "incomplete / limited evidence",
+      "task": "Compare Alpha and Beta on price, reliability, and enterprise support.",
+      "result": {
+        "relevance": 1.0,
+        "completeness": 0.8333,
+        "source_coverage": 1.0,
+        "grounding": 1.0,
+        "format_quality": 1.0,
+        "overall": 0.9667,
+        "checks": {
+          "relevance": {
+            "goal_terms": [
+              "alpha",
+              "beta",
+              "enterprise",
+              "price",
+              "reliability",
+              "support."
+            ],
+            "matched_goal_terms": [
+              "alpha",
+              "beta",
+              "enterprise",
+              "price",
+              "reliability",
+              "support."
+            ]
+          },
+          "completeness": {
+            "findings_present": true,
+            "sources_present": true,
+            "executive_summary_present": true,
+            "limitations_present": true,
+            "no_unresolved_missing_information": false,
+            "terminated_within_iteration_limit": true
+          },
+          "source_coverage": {
+            "collected_urls": [
+              "https://alpha.example/pricing"
+            ],
+            "cited_urls": [
+              "https://alpha.example/pricing"
+            ],
+            "matched_urls": [
+              "https://alpha.example/pricing"
+            ],
+            "unknown_cited_urls": [],
+            "uncited_collected_urls": []
+          },
+          "grounding": {
+            "claims_considered": 1,
+            "supported_claims": 1,
+            "unsupported_claims": [],
+            "method": "key-finding lexical overlap >= 0.50 against findings/source metadata"
+          },
+          "format_quality": {
+            "required_sections": {
+              "Executive Summary": true,
+              "Research Question": true,
+              "Methodology": true,
+              "Key Findings": true,
+              "Comparison / Analysis": true,
+              "Limitations": true,
+              "Sources": true
+            }
+          }
+        },
+        "warnings": [
+          "Run ended with 3 unresolved information gap(s)."
+        ]
+      }
+    }
+  ]
+}

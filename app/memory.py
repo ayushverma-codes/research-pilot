@@ -73,7 +73,14 @@ def _tokenize(text: str) -> set:
 def _memory_path(path: Optional[Path] = None) -> Path:
     if path is not None:
         return Path(path)
-    return Path(os.getenv("RESEARCHPILOT_MEMORY_PATH", str(DEFAULT_MEMORY_PATH)))
+
+    # Treat an unset *or blank* environment variable as "use the default".
+    # Path("") resolves to the current directory ("."), which would make
+    # load_memory try to read a directory as JSON and save_memory try to
+    # overwrite it. A blank value is common in copied .env templates, so it
+    # must be handled explicitly.
+    configured = os.getenv("RESEARCHPILOT_MEMORY_PATH", "").strip()
+    return Path(configured).expanduser() if configured else DEFAULT_MEMORY_PATH
 
 
 def load_memory(path: Optional[Path] = None) -> Dict[str, Any]:

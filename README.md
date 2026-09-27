@@ -181,6 +181,71 @@ of the target schema is left out rather than stubbed with fake data.
 > treat it as a fresh, empty store — no error, no crash, nothing to
 > indicate anything was lost).
 
+## Evaluation (Phase 7)
+
+Phase 7 adds a separate deterministic evaluation layer for **completed**
+research runs. It does not replace or modify the Phase 4 in-loop critic in
+`app/evaluator.py`; the benchmark logic lives in `app/evaluation.py`, and
+`python -m app.evaluate` runs a fixed fixture suite from
+`app/evaluation_data/phase7_cases.json`.
+
+The evaluator only uses observable artifacts (`user_goal`, `findings`,
+`sources`, `iteration`, `missing_information`, and `final_report`). It never
+reads or exposes hidden chain-of-thought, and it makes no LLM call by default.
+The five reported 0.0-1.0 metrics are:
+
+- **Task relevance** — fraction of meaningful task terms that appear in the
+  final report. This is lexical coverage, not semantic correctness.
+- **Completeness** — deterministic checks for findings, sources, executive
+  summary, limitations, no unresolved `missing_information`, and termination
+  within the allowed iteration limit.
+- **Source coverage** — mean of URL recall and precision between collected
+  `state.sources` and URLs actually cited in the report; unknown report URLs
+  are flagged.
+- **Grounding / evidence support** — checks `Key Findings` bullets against
+  gathered findings/source metadata using a transparent lexical-overlap
+  heuristic (>= 0.50). Weakly supported bullets are listed as warnings. This
+  is not factual entailment or proof that a claim is true.
+- **Report structure / format** — presence of all seven required Phase 5
+  sections.
+
+`overall` is the unweighted arithmetic mean of those five diagnostic scores.
+No score is treated as objective ground truth. An optional LLM judge is not
+needed for the current suite; if added later, it should remain a clearly
+separate supplemental signal rather than overwrite deterministic metrics.
+
+Run it with:
+
+```bash
+python -m app.evaluate
+```
+
+Each run prints a concise aggregate/per-case summary and saves the full JSON
+result under `output/evaluations/evaluation_<timestamp>.json`. The fixture
+dataset covers simple factual research, a multi-entity comparison, a task
+requiring an additional calculation/research step, and intentionally limited
+evidence.
+
+### Phase 7 sample results
+
+Actual output from the deterministic fixture suite in this implementation
+(4 cases):
+
+| Metric | Score |
+|---|---:|
+| Relevance | 1.0000 |
+| Completeness | 0.9583 |
+| Source coverage | 1.0000 |
+| Grounding | 0.9167 |
+| Format quality | 1.0000 |
+| Overall | 0.9750 |
+
+Per-case overall scores from the same run: `simple_factual=1.0000`,
+`multi_entity_comparison=1.0000`, `additional_research=0.9333`, and
+`limited_evidence=0.9667`. These are **fixture-suite diagnostics**, not a
+live-web benchmark, not a claim that the agent improved, and not a guarantee
+that future/live research will achieve the same values.
+
 ## Project structure
 
 ```
@@ -193,8 +258,11 @@ researchpilot/
 │   ├── planner.py
 │   ├── researcher.py     # NEW (Phase 3): routes each step to a tool via tool_selector
 │   ├── tool_selector.py  # NEW (Phase 3): decides web_search / page_reader / calculator
-│   ├── evaluator.py      # coverage + quality critic; routing decision (can
-│   │                     #   propose a URL to read, or a calculation)
+│   ├── evaluator.py      # Phase 4 in-loop coverage + quality critic / router
+│   ├── evaluation.py     # NEW (Phase 7): deterministic completed-run metrics
+│   ├── evaluate.py       # NEW (Phase 7): `python -m app.evaluate` suite CLI
+│   ├── evaluation_data/
+│   │   └── phase7_cases.json  # representative fixed evaluation fixtures
 │   ├── reporter.py       # structured multi-section report (see "Report
 │   │                     #   format" above), not just a plain answer
 │   ├── memory.py         # NEW (Phase 6): JSON-backed run history +
@@ -207,6 +275,7 @@ researchpilot/
 │                              #   compatible with a bare, unformatted body)
 ├── tests/
 ├── output/                # generated reports land here
+│   └── evaluations/       # Phase 7 timestamped evaluation JSON results
 ├── memory/                 # NEW (Phase 6): agent_memory.json lands here
 ├── .env.example
 ├── requirements.txt
@@ -245,15 +314,22 @@ file under `output/`.
 |---|---|
 | `LLM_PROVIDER` | Which LLM backend to use: `groq` (default) or `anthropic`. |
 | `LLM_MODEL` | Model name passed to the provider SDK, e.g. `openai/gpt-oss-120b` (Groq) or `claude-sonnet-4-6` (Anthropic). |
+| `LLM_TIMEOUT_SECONDS` | Maximum duration for one provider request before it fails cleanly (default `60`). Prevents a stalled LLM request from hanging the agent indefinitely. |
 | `GROQ_API_KEY` | Your Groq API key. Required when `LLM_PROVIDER=groq`. Never commit this. |
 | `GROQ_REQUESTS_PER_MINUTE` | Client-side throttle for Groq calls (default `25`). See "Rate limiting" below. |
 | `ANTHROPIC_API_KEY` | Your Anthropic API key. Only required when `LLM_PROVIDER=anthropic`. |
 | `RESEARCHPILOT_MAX_ITERATIONS` | Max research/evaluate loop iterations before forcing a report (default `3`). Prevents infinite loops. |
-| `RESEARCHPILOT_MEMORY_PATH` | Path to the JSON memory store (default `memory/agent_memory.json`). See "Memory" above. |
+| `RESEARCHPILOT_MEMORY_PATH` | Path to the JSON memory store (default `memory/agent_memory.json`). Blank/unset values safely fall back to that default. See "Memory" above. |
+| `RESEARCHPILOT_EVALUATOR_TIMEOUT_SECONDS` | Critic wall-clock ceiling (default `45`). On the first critic timeout, the agent performs one deterministic deeper-source recovery pass using already-collected URLs; a later timeout ends research and reports the uncertainty explicitly. |
+| `RESEARCHPILOT_REPORTER_TIMEOUT_SECONDS` | Final report LLM wall-clock ceiling (default `45`). If synthesis exceeds it, ResearchPilot immediately produces a deterministic evidence-only fallback report instead of hanging. If the critic explicitly did not confirm evidence sufficiency, LLM narrative synthesis is skipped entirely and an evidence-only report is produced. |
+| `RESEARCHPILOT_REPORTER_MAX_TOKENS` | Maximum tokens requested for final narrative synthesis (default `1000`). |
+| `RESEARCHPILOT_EVALUATOR_MAX_TOKENS` | Maximum critic JSON generation budget (default `900`). Kept bounded because the critic returns structured JSON only. |
 
 ### Rate limiting (Groq)
 
-Two layers, both in `app/llm_provider.py`:
+Provider calls also have a bounded request timeout (`LLM_TIMEOUT_SECONDS`, default 60 seconds), so a stalled API request returns control instead of hanging forever. The in-loop critic uses its own 45-second ceiling and one bounded recovery pass described below.
+
+Two Groq rate-limit layers, both in `app/llm_provider.py`:
 
 1. **Proactive throttle** — `RateLimiter` enforces a minimum gap between
    calls based on `GROQ_REQUESTS_PER_MINUTE` (default 25/min, kept under
@@ -275,9 +351,9 @@ python -m pytest tests/ -v
 ```
 
 `tests/test_mvp.py` (Phase 1), `tests/test_phase2.py` (Phase 2),
-`tests/test_phase3.py` (Phase 3), `tests/test_phase4.py` (Phase 4), and
-`tests/test_phase5.py` (Phase 5), and `tests/test_phase6.py` (Phase 6,
-new) cover `AgentState`, all four tools (`calculator`, `page_reader`,
+`tests/test_phase3.py` (Phase 3), `tests/test_phase4.py` (Phase 4),
+`tests/test_phase5.py` (Phase 5), `tests/test_phase6.py` (Phase 6), and
+`tests/test_phase7.py` (Phase 7) cover `AgentState`, all four tools (`calculator`, `page_reader`,
 `report_writer`, and `web_search` indirectly via the researcher),
 JSON-extraction (planner + evaluator), the evaluator/critic's routing
 decision, iteration cap, and quality-`issues` surfacing,
@@ -289,7 +365,9 @@ store load/save/corrupt-file handling, `record_run`'s
 successful/failed-query split and domain de-duplication,
 `retrieve_relevant_experience`'s keyword-overlap matching, and the
 planner's inclusion (or graceful omission) of a memory hint in its
-prompt — all without needing network access or an API key
+prompt, plus Phase 7 evaluation-result creation, required-section checks,
+source coverage, grounding warnings, incomplete research, and iteration-limit
+behavior — all without needing network access or an API key
 (`requests.get` / `web_search` / `read_page` / the LLM client are
 monkeypatched out wherever a test would otherwise need the network;
 `write_report` and the memory store's file I/O are exercised for real
@@ -300,6 +378,20 @@ verify those manually with `python -m app.main "..."` (see "How this was
 tested" below).
 
 ## How this was tested
+
+### Phase 7
+
+Executed in the Phase 7 build environment with the real installed project
+dependencies:
+- `pytest tests/ -v`: **97/97 passed** after the final Phase 7 stabilization patch. This includes all Phase 1-7 regression tests plus coverage for provider hard timeouts, blank memory-path handling, bounded critic prompts, one-shot timeout recovery, second-timeout termination, empty/malformed reporter output, reporter hard timeouts, and the grounding gate that blocks narrative synthesis when critic sufficiency is unconfirmed.
+- `python -m app.evaluate`: **4 fixture cases executed** and a timestamped
+  JSON result was written to `output/evaluations/`. Aggregate scores were
+  relevance `1.0000`, completeness `0.9583`, source coverage `1.0000`,
+  grounding `0.9167`, format quality `1.0000`, overall `0.9750`.
+- No live web or LLM call is part of the default Phase 7 suite, deliberately,
+  so rerunning it is reproducible and does not depend on changing search
+  results, provider nondeterminism, credentials, or rate limits. Live agent
+  calls are separately protected by `LLM_TIMEOUT_SECONDS` (default 60s).
 
 ### Phase 6
 
@@ -455,20 +547,15 @@ compare to the free plan's limits?", so you can watch [TOOL] web_search,
 [TOOL] calculator, and potentially [TOOL] page_reader all fire in one
 run.
 
-## Known limitations (Phase 6 stage, expected)
+## Known limitations (Phase 7 stage, expected)
 
 - The critic's quality `issues` (unsupported claims, off-topic sources)
   are surfaced in the report's Limitations section, but don't otherwise
   change agent behavior beyond what Phase 2's coverage check already
   drove — the critic doesn't yet re-route research specifically to
   resolve a quality issue that isn't also a coverage gap.
-- `Key Findings` vs `Comparison / Analysis` are only as well-separated as
-  the reporter LLM's instruction-following; the split is not verified
-  programmatically beyond "each came from its own requested heading".
-- If the evaluator's LLM call fails (bad JSON, API error), the code
-  fails *open* — it assumes evidence is sufficient and moves to the
-  reporter, rather than looping forever or crashing. This is a deliberate
-  simplicity/robustness tradeoff for this phase.
+- When the critic confirms sufficiency, `Key Findings` vs `Comparison / Analysis` still depend on the reporter LLM following the requested section semantics. When the critic explicitly does **not** confirm sufficiency, narrative synthesis is skipped and the deterministic evidence-only fallback is used instead.
+- If the evaluator's LLM call fails, the code does **not** mark evidence sufficient. A first timeout can trigger one bounded deeper-source recovery pass. If sufficiency still cannot be confirmed, the reporter skips LLM narrative synthesis and emits an evidence-only report so unsupported claims are not promoted into confident conclusions.
 - Web search still uses a no-key DuckDuckGo HTML scrape — fine for this
   stage, but more fragile than a paid search API.
 - Tool selection (`app/tool_selector.py`) is deterministic pattern
@@ -494,5 +581,32 @@ run.
 - The memory store is a single flat JSON file with no size cap or
   pruning — fine at prototype/contest scale, but it will grow unbounded
   over many real runs.
-- No separate evaluation module yet (Phase 7) — no deterministic
-  relevance/coverage/completeness scoring of a finished run.
+- Phase 7's default benchmark uses fixed completed-run fixtures rather than
+  executing live research. It is useful for regression and transparency, but
+  it does not measure current web-search quality or provider behavior.
+- Relevance and grounding are lexical heuristics. Synonyms/paraphrases can be
+  under-scored, while lexical overlap can over-score a claim that is phrased
+  similarly but is still wrong; the evaluator therefore flags likely issues
+  rather than claiming semantic truth.
+- The four-case dataset is intentionally small and representative, not a
+  statistically meaningful benchmark. Scores should not be used to claim the
+  agent improved without a larger controlled comparison across versions.
+
+### Live-run timeout behavior
+
+Provider SDK calls are protected by `LLM_TIMEOUT_SECONDS` (default 60 seconds),
+and the critic has a stricter `RESEARCHPILOT_EVALUATOR_TIMEOUT_SECONDS`
+(default 45 seconds). If the first critic request exceeds that wall-clock
+limit, ResearchPilot does **not** mark the evidence sufficient. Instead it
+deterministically selects up to three already-collected, unread source URLs
+and performs one deeper `page_reader` recovery pass before running the critic
+again. If the critic is still unavailable after that bounded recovery, the
+loop stops and the report explicitly records that evidence sufficiency could
+not be confirmed. In that state the reporter **does not call the narrative
+LLM at all**; it emits a deterministic evidence-only report from the findings
+and sources already stored in state. This prevents an unverified synthesis
+from inventing prices, dates, model names, or other conclusions. Timeout
+failures are not retried immediately, while fast malformed/empty critic
+responses may still retry once. Critic and report prompts also retain only a
+bounded amount of the newest gathered evidence so later research passes do
+not grow the LLM input without limit.

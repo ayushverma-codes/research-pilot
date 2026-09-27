@@ -278,3 +278,11 @@ def test_memory_persists_across_separate_record_and_retrieve_calls(tmp_path):
         "Notion pricing for teams",
         "Best espresso machines under $500",
     }
+
+
+def test_blank_memory_path_env_uses_default(monkeypatch):
+    """A copied .env with RESEARCHPILOT_MEMORY_PATH= must not resolve to '.'."""
+    import app.memory as memory_module
+
+    monkeypatch.setenv("RESEARCHPILOT_MEMORY_PATH", "   ")
+    assert memory_module._memory_path() == memory_module.DEFAULT_MEMORY_PATH

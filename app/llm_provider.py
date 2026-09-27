@@ -13,13 +13,62 @@ from __future__ import annotations
 import os
 import time
 import threading
+import queue
 from dotenv import load_dotenv
 
 load_dotenv()
 
+DEFAULT_LLM_TIMEOUT_SECONDS = 60.0
+
+
+def _llm_timeout_seconds() -> float:
+    """Return a positive, bounded provider request timeout from the environment."""
+    raw = os.getenv("LLM_TIMEOUT_SECONDS", str(DEFAULT_LLM_TIMEOUT_SECONDS)).strip()
+    try:
+        timeout = float(raw)
+    except ValueError as e:
+        raise LLMError(
+            f"LLM_TIMEOUT_SECONDS must be a positive number of seconds, got {raw!r}."
+        ) from e
+    if timeout <= 0:
+        raise LLMError("LLM_TIMEOUT_SECONDS must be greater than 0.")
+    return timeout
+
 
 class LLMError(RuntimeError):
     """Raised when the LLM call fails or is misconfigured."""
+
+
+
+
+def _run_with_hard_timeout(call, timeout_seconds: float):
+    """Run a provider SDK call behind a wall-clock timeout.
+
+    Provider/http-client timeouts are still configured as the first line of
+    defence, but they can cover individual socket phases rather than the whole
+    call on every SDK/version.  This daemon-thread guard guarantees the CLI
+    regains control after ``timeout_seconds`` even if the SDK itself wedges.
+    """
+    results: queue.Queue = queue.Queue(maxsize=1)
+
+    def runner():
+        try:
+            results.put((True, call()))
+        except BaseException as exc:  # propagate provider exceptions to caller
+            results.put((False, exc))
+
+    worker = threading.Thread(target=runner, daemon=True, name="researchpilot-llm-call")
+    worker.start()
+    try:
+        ok, value = results.get(timeout=timeout_seconds)
+    except queue.Empty as e:
+        raise LLMError(
+            f"LLM call exceeded the {timeout_seconds:g}s hard timeout."
+        ) from e
+
+    if ok:
+        return value
+    raise value
 
 
 class RateLimiter:
@@ -63,16 +112,27 @@ class AnthropicClient:
                 "ANTHROPIC_API_KEY is not set. Copy .env.example to .env "
                 "and add your key."
             )
-        self._client = anthropic.Anthropic(api_key=api_key)
+        # Disable SDK-level retries so one provider stall cannot silently turn
+        # into several long waits. Higher-level agent nodes already own their
+        # bounded retry/fallback behavior.
+        self._client = anthropic.Anthropic(
+            api_key=api_key,
+            timeout=_llm_timeout_seconds(),
+            max_retries=0,
+        )
         self.model = model
 
     def complete(self, prompt: str, system: str = "", max_tokens: int = 1500) -> str:
         try:
-            response = self._client.messages.create(
-                model=self.model,
-                max_tokens=max_tokens,
-                system=system or "You are a helpful assistant.",
-                messages=[{"role": "user", "content": prompt}],
+            timeout = _llm_timeout_seconds()
+            response = _run_with_hard_timeout(
+                lambda: self._client.messages.create(
+                    model=self.model,
+                    max_tokens=max_tokens,
+                    system=system or "You are a helpful assistant.",
+                    messages=[{"role": "user", "content": prompt}],
+                ),
+                timeout,
             )
         except Exception as e:  # noqa: BLE001 - surface as a single app-level error
             raise LLMError(f"LLM call failed: {e}") from e
@@ -110,7 +170,11 @@ class GroqClient:
         # max_retries=0 here: our own loop below owns retry/backoff decisions
         # (so we can rate-limit-aware sleep on the exact retry-after value)
         # instead of letting the SDK retry silently with its own backoff.
-        self._client = groq.Groq(api_key=api_key, max_retries=0)
+        self._client = groq.Groq(
+            api_key=api_key,
+            max_retries=0,
+            timeout=_llm_timeout_seconds(),
+        )
         self.model = model
         self.max_retries = max_retries
         self._limiter = RateLimiter(requests_per_minute)
@@ -125,10 +189,14 @@ class GroqClient:
         for attempt in range(self.max_retries + 1):
             self._limiter.wait()
             try:
-                response = self._client.chat.completions.create(
-                    model=self.model,
-                    max_tokens=max_tokens,
-                    messages=messages,
+                timeout = _llm_timeout_seconds()
+                response = _run_with_hard_timeout(
+                    lambda: self._client.chat.completions.create(
+                        model=self.model,
+                        max_tokens=max_tokens,
+                        messages=messages,
+                    ),
+                    timeout,
                 )
                 return (response.choices[0].message.content or "").strip()
             except self._groq.RateLimitError as e:

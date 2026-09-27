@@ -35,18 +35,18 @@ import os
 import re
 
 from app.state import AgentState
-from app.llm_provider import get_llm_client
+from app.llm_provider import get_llm_client, _run_with_hard_timeout, LLMError
 
 # Hard ceiling on research loops, so a stubborn/ambiguous goal can never spin
 # forever. Configurable for experimentation, but always enforced.
 MAX_ITERATIONS = int(os.getenv("RESEARCHPILOT_MAX_ITERATIONS", "3"))
 
-# Token budget for the critic's own JSON response. Live testing showed 700
-# was too tight once the critic has several quality "issues" to describe on
-# top of "missing_information"/"additional_queries" - the response got cut
-# off mid-string, which then failed JSON parsing entirely (see
-# _extract_json_object) instead of just being a slightly shorter verdict.
-EVALUATOR_MAX_TOKENS = int(os.getenv("RESEARCHPILOT_EVALUATOR_MAX_TOKENS", "1200"))
+# Bounded token budget for the critic's small structured JSON response.
+# Keep enough headroom to avoid truncating several issues/gaps, but do not
+# request report-sized generations from a routing decision node.
+EVALUATOR_MAX_TOKENS = int(os.getenv("RESEARCHPILOT_EVALUATOR_MAX_TOKENS", "900"))
+EVALUATOR_MAX_FINDINGS_CHARS = int(os.getenv("RESEARCHPILOT_EVALUATOR_MAX_FINDINGS_CHARS", "12000"))
+EVALUATOR_CALL_TIMEOUT_SECONDS = float(os.getenv("RESEARCHPILOT_EVALUATOR_TIMEOUT_SECONDS", "45"))
 
 EVALUATOR_SYSTEM_PROMPT = """You are a research evidence checker (critic).
 Given a research goal and the findings gathered so far, judge the evidence
@@ -164,6 +164,68 @@ def _drop_hallucinated_urls(queries: list, known_urls: set) -> list:
     return kept
 
 
+
+def _compact_findings_for_critic(findings: list[str], max_chars: int = EVALUATOR_MAX_FINDINGS_CHARS) -> str:
+    """Keep the critic prompt bounded as research accumulates across loops.
+
+    We retain the newest evidence first because additional-research passes tend
+    to contain the detailed page reads requested by the previous critic.  A
+    bounded prompt avoids repeatedly sending an ever-growing transcript to the
+    model, which can make the second critic call unnecessarily slow.
+    """
+    if not findings:
+        return "(no findings yet)"
+
+    selected: list[str] = []
+    used = 0
+    for finding in reversed(findings):
+        clean = str(finding).strip()
+        if not clean:
+            continue
+        remaining = max_chars - used
+        if remaining <= 0:
+            break
+        piece = clean[:remaining]
+        selected.append(piece)
+        used += len(piece) + 2
+    selected.reverse()
+    prefix = "[Earlier findings omitted to keep critic input bounded.]\n\n" if len(selected) < len(findings) else ""
+    return prefix + "\n\n".join(selected)
+
+
+
+
+def _fallback_source_reads(state: AgentState, limit: int = 3) -> list[str]:
+    """Choose a small deterministic set of collected sources to read in depth.
+
+    This is used only when the critic itself times out on the *first* evidence
+    pass.  It keeps the agentic loop alive without inventing a new search query:
+    ResearchPilot reuses URLs it already collected, prefers sources whose
+    metadata overlaps the user goal, and schedules at most ``limit`` unread
+    URLs.  The recovery pass is intentionally one-shot; a later critic failure
+    proceeds to the report with an explicit limitation instead of looping.
+    """
+    completed = set(state.completed_steps)
+    goal_terms = {
+        token
+        for token in re.findall(r"[a-z0-9]+", state.user_goal.lower())
+        if len(token) >= 3
+    }
+
+    ranked: list[tuple[int, int, str]] = []
+    seen: set[str] = set()
+    for index, source in enumerate(state.sources):
+        url = source.url.strip()
+        if not url or url in seen or url in completed:
+            continue
+        seen.add(url)
+        haystack = f"{source.title} {source.snippet} {url}".lower()
+        overlap = sum(1 for term in goal_terms if term in haystack)
+        ranked.append((-overlap, index, url))
+
+    ranked.sort()
+    return [url for _, _, url in ranked[:limit]]
+
 def evaluate_evidence(state: AgentState) -> dict:
     """
     Decide whether current findings are enough to report, or whether another
@@ -187,7 +249,7 @@ def evaluate_evidence(state: AgentState) -> dict:
         return {"iteration": iteration, "missing_information": [], "critique": critique}
 
     llm = get_llm_client()
-    findings_text = "\n\n".join(state.findings) if state.findings else "(no findings yet)"
+    findings_text = _compact_findings_for_critic(state.findings)
     already_searched = ", ".join(state.completed_steps) or "(none)"
     known_sources_text = _format_known_sources(state)
     prompt = (
@@ -210,7 +272,11 @@ def evaluate_evidence(state: AgentState) -> dict:
     MAX_ATTEMPTS = 2
     result = None
     last_error: Exception | None = None
+    attempts_used = 0
+    timed_out = False
+    print(f"[CRITIC] Evaluating evidence (iteration {iteration}/{MAX_ITERATIONS})...")
     for attempt in range(1, MAX_ATTEMPTS + 1):
+        attempts_used = attempt
         attempt_prompt = prompt
         if attempt > 1:
             attempt_prompt += (
@@ -218,21 +284,67 @@ def evaluate_evidence(state: AgentState) -> dict:
                 "Respond with ONLY the JSON object, nothing else.)"
             )
         try:
-            raw = llm.complete(attempt_prompt, system=EVALUATOR_SYSTEM_PROMPT, max_tokens=EVALUATOR_MAX_TOKENS)
+            raw = _run_with_hard_timeout(
+                lambda: llm.complete(
+                    attempt_prompt,
+                    system=EVALUATOR_SYSTEM_PROMPT,
+                    max_tokens=EVALUATOR_MAX_TOKENS,
+                ),
+                EVALUATOR_CALL_TIMEOUT_SECONDS,
+            )
             result = _extract_json_object(raw)
             break
         except Exception as e:  # noqa: BLE001 — a broken evaluator must not kill the run
             last_error = e
+            # A hard timeout is unlikely to improve on an immediate retry and
+            # would make the CLI appear frozen for another full timeout window.
+            # Malformed/empty fast responses still get one bounded retry.
+            if isinstance(e, LLMError) and "hard timeout" in str(e).lower():
+                timed_out = True
+                print(f"[CRITIC] Evaluation timed out ({e}).")
+                break
             if attempt < MAX_ATTEMPTS:
                 print(f"[CRITIC] Evaluation attempt {attempt} failed ({e}) — retrying once.")
 
     if result is None:
-        print(f"[CRITIC] Evaluation failed after {MAX_ATTEMPTS} attempt(s) ({last_error}) — assuming evidence is sufficient.")
+        failure_text = f"Critic evaluation failed after {attempts_used} attempt(s): {last_error}"
+
+        # Timeout-specific deterministic recovery: on the first critic pass,
+        # read a few already-collected URLs in depth and then run the critic
+        # once more. This preserves the PLAN -> ACT -> OBSERVE -> CRITIQUE loop
+        # without inventing URLs or allowing unbounded retries.
+        recovery_reads = _fallback_source_reads(state) if timed_out and iteration == 1 else []
+        if recovery_reads:
+            gap = "Critic timed out before evidence sufficiency could be confirmed; deeper source inspection is required."
+            print(
+                f"[DECISION] Critic unavailable — queueing one bounded recovery pass "
+                f"with {len(recovery_reads)} collected source(s): {recovery_reads}"
+            )
+            critique = {
+                "sufficient": False,
+                "missing_information": [gap],
+                "issues": [failure_text],
+                "recommended_action": "Read collected sources in depth, then retry the evidence check once.",
+            }
+            return {
+                "iteration": iteration,
+                "missing_information": [gap],
+                "plan": state.plan + recovery_reads,
+                "critique": critique,
+            }
+
+        # No safe recovery source (or the bounded recovery pass was already
+        # used). End the loop, but do NOT label the evidence sufficient. The
+        # report receives the critic failure as an explicit limitation.
+        print(
+            f"[CRITIC] Evaluation failed after {attempts_used} attempt(s) "
+            f"({last_error}) — proceeding to report with evidence sufficiency unconfirmed."
+        )
         critique = {
-            "sufficient": True,
+            "sufficient": False,
             "missing_information": [],
-            "issues": [f"Critic evaluation itself failed after {MAX_ATTEMPTS} attempt(s): {last_error}"],
-            "recommended_action": "Evaluation failed; proceeding to report on existing findings.",
+            "issues": [failure_text, "Evidence sufficiency could not be confirmed because the critic was unavailable."],
+            "recommended_action": "Critic unavailable after bounded recovery; report only the evidence actually gathered.",
         }
         return {"iteration": iteration, "missing_information": [], "critique": critique}
 

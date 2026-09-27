@@ -26,10 +26,15 @@ report can never claim research happened that the run didn't actually do.
 
 from __future__ import annotations
 
+import os
 import re
 
 from app.state import AgentState
-from app.llm_provider import get_llm_client
+from app.llm_provider import get_llm_client, _run_with_hard_timeout
+
+REPORTER_MAX_FINDINGS_CHARS = 9000
+REPORTER_MAX_TOKENS = int(os.getenv("RESEARCHPILOT_REPORTER_MAX_TOKENS", "1000"))
+REPORTER_CALL_TIMEOUT_SECONDS = float(os.getenv("RESEARCHPILOT_REPORTER_TIMEOUT_SECONDS", "45"))
 
 REPORTER_SYSTEM_PROMPT = """You are a research report writer.
 Using ONLY the findings provided, write the analytical portion of a
@@ -159,31 +164,115 @@ def _build_sources(state: AgentState) -> str:
     return "\n".join(lines) if lines else "(no sources)"
 
 
-def generate_report(state: AgentState) -> dict:
-    llm = get_llm_client()
 
-    findings_text = "\n\n".join(state.findings) if state.findings else "(no findings gathered)"
-    prompt = (
-        f"Research question: {state.user_goal}\n\n"
-        f"Findings gathered:\n{findings_text}\n\n"
-        "Write the four sections now."
-    )
+def _compact_findings_for_report(findings: list[str], max_chars: int = REPORTER_MAX_FINDINGS_CHARS) -> str:
+    """Bound the report-writer prompt while preserving the newest detailed evidence."""
+    if not findings:
+        return "(no findings gathered)"
+    selected: list[str] = []
+    used = 0
+    for finding in reversed(findings):
+        clean = str(finding).strip()
+        if not clean:
+            continue
+        remaining = max_chars - used
+        if remaining <= 0:
+            break
+        selected.append(clean[:remaining])
+        used += len(selected[-1]) + 2
+    selected.reverse()
+    prefix = "[Earlier findings omitted to keep report input bounded.]\n\n" if len(selected) < len(findings) else ""
+    return prefix + "\n\n".join(selected)
 
-    raw = llm.complete(prompt, system=REPORTER_SYSTEM_PROMPT, max_tokens=2000)
-    sections = _split_sections(raw)
 
-    if sections:
-        exec_summary = sections.get("Executive Summary", "").strip()
-        key_findings = sections.get("Key Findings", "").strip()
-        comparison = sections.get("Comparison / Analysis", "").strip()
-        llm_limitations = sections.get("Limitations", "").strip()
+def _fallback_narrative(state: AgentState, reason: str) -> tuple[str, str, str, str]:
+    """Build a deterministic, evidence-only narrative when report synthesis fails.
+
+    This keeps the CLI responsive without inventing an answer. Findings are quoted
+    only as compact evidence summaries already present in state.
+    """
+    if state.findings:
+        exec_summary = (
+            "The final narrative synthesis could not be completed within its bounded "
+            "execution window. The report therefore preserves the gathered evidence "
+            "below without adding new conclusions."
+        )
+        bullets = []
+        for finding in state.findings[-5:]:
+            clean = " ".join(str(finding).split())
+            if clean:
+                bullets.append(f"- {_clean_bullet_text(clean)}")
+        key_findings = "\n".join(bullets) or "(no findings gathered)"
     else:
-        # LLM didn't follow the requested format - fall back to putting
-        # its whole response in the summary rather than losing content.
-        exec_summary = raw.strip()
-        key_findings = ""
-        comparison = ""
-        llm_limitations = ""
+        exec_summary = (
+            "The final narrative synthesis could not be completed, and no findings "
+            "were gathered that support an answer to the research question."
+        )
+        key_findings = "(no findings gathered)"
+
+    comparison = (
+        "Automated comparison/analysis is unavailable because final LLM synthesis "
+        "did not complete. Review the evidence-only findings and sources below."
+    )
+    llm_limitations = f"- Final report synthesis unavailable: {_clean_bullet_text(reason)}"
+    return exec_summary, key_findings, comparison, llm_limitations
+
+
+def generate_report(state: AgentState) -> dict:
+    # Grounding gate: when the critic explicitly says evidence sufficiency was
+    # not confirmed, do not ask another LLM to turn that same uncertain evidence
+    # into confident prose. This is deliberately deterministic: the report keeps
+    # the gathered evidence and sources, but adds no new factual conclusions.
+    critic_unconfirmed = bool(state.critique) and state.critique.get("sufficient") is False
+
+    if critic_unconfirmed:
+        reason = "critic did not confirm evidence sufficiency; narrative synthesis skipped to avoid unsupported claims"
+        print("[REPORT] Evidence sufficiency unconfirmed — using grounded evidence-only report.")
+        exec_summary, key_findings, comparison, llm_limitations = _fallback_narrative(state, reason)
+    else:
+        llm = get_llm_client()
+        findings_text = _compact_findings_for_report(state.findings)
+        prompt = (
+            f"Research question: {state.user_goal}\n\n"
+            f"Findings gathered:\n{findings_text}\n\n"
+            "Write the four sections now."
+        )
+
+        print(f"[REPORT] Generating final report (max {REPORTER_CALL_TIMEOUT_SECONDS:g}s; fallback enabled)...")
+        try:
+            raw = _run_with_hard_timeout(
+                lambda: llm.complete(
+                    prompt,
+                    system=REPORTER_SYSTEM_PROMPT,
+                    max_tokens=REPORTER_MAX_TOKENS,
+                ),
+                REPORTER_CALL_TIMEOUT_SECONDS,
+            )
+            raw = (raw or "").strip()
+            sections = _split_sections(raw)
+            required = {"Executive Summary", "Key Findings", "Comparison / Analysis", "Limitations"}
+
+            # Empty, plain-text, or partially formatted model output is not a
+            # successful synthesis. Treat it exactly like a failed LLM call so
+            # gathered evidence is preserved instead of being replaced by
+            # placeholder sections such as "(no findings gathered)".
+            if not raw or not required.issubset(sections):
+                raise ValueError("reporter output was empty or missing required sections")
+
+            exec_summary = sections["Executive Summary"].strip()
+            key_findings = sections["Key Findings"].strip()
+            comparison = sections["Comparison / Analysis"].strip()
+            llm_limitations = sections["Limitations"].strip()
+
+            # If there was gathered evidence, an empty Key Findings section is
+            # also considered invalid synthesis; deterministic fallback will
+            # surface the actual evidence from state.findings.
+            if state.findings and not key_findings:
+                raise ValueError("reporter output omitted key findings despite gathered evidence")
+        except Exception as exc:  # bounded fail-open: preserve evidence and finish
+            reason = str(exc) or exc.__class__.__name__
+            print(f"[REPORT] Synthesis unavailable ({_clean_bullet_text(reason)}) — using deterministic fallback.")
+            exec_summary, key_findings, comparison, llm_limitations = _fallback_narrative(state, reason)
 
     methodology = _build_methodology(state)
     limitations = _build_limitations(state, llm_limitations)
