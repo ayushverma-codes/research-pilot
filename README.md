@@ -7,6 +7,20 @@ its own findings, re-plans when the evidence is thin, and writes a structured
 Markdown report — grounded only in what it actually found.
 
 ---
+## 🎥 Demo Video
+
+Watch the full 7 minute demo here:
+
+
+[![Watch the ResearchPilot Demo](https://img.youtube.com/vi/jiIY8DXxz6I/maxresdefault.jpg)](https://youtu.be/jiIY8DXxz6I)
+
+**Watch on YouTube:**  
+https://youtu.be/jiIY8DXxz6I
+
+The demo shows the full agentic workflow in action:
+**Plan → Act → Observe → Critique → Re-plan → Report**
+
+---
 
 ## Table of contents
 
