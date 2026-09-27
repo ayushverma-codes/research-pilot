@@ -18,6 +18,11 @@ This is the "Tool Selection -> Tool Execution -> Observation" part of the
 target workflow. Phase 2's "the plan can grow between passes, so this
 node may run more than once" behaviour is unchanged: it only processes
 steps not already in `completed_steps`.
+
+Phase 10 addition: after processing pending steps, an explicit `[STATE]`
+line is printed summarizing the state update (finding/source/step
+counts), so the STATE UPDATE stage in the target workflow diagram is
+visible in the terminal, not just implied by the OBSERVE lines above it.
 """
 
 from __future__ import annotations
@@ -119,6 +124,11 @@ def research(state: AgentState) -> dict:
             _run_web_search(step, findings, sources, tool_history)
 
         completed_steps.append(step)
+
+    print(
+        f"[STATE] findings={len(findings)} sources={len(sources)} "
+        f"completed_steps={len(completed_steps)}/{len(state.plan)}"
+    )
 
     return {
         "findings": findings,
