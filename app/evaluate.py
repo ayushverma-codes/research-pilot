@@ -10,7 +10,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from app.evaluation import EvaluationResult, evaluate_run
+from app.evaluation import evaluate_run
 from app.state import AgentState
 
 DATASET_PATH = Path(__file__).with_name("evaluation_data") / "phase7_cases.json"

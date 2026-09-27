@@ -23,7 +23,7 @@ steps not already in `completed_steps`.
 from __future__ import annotations
 
 from app.state import AgentState, Source, ToolCallRecord
-from app.tool_selector import choose_tool, WEB_SEARCH, PAGE_READER, CALCULATOR
+from app.tool_selector import choose_tool, PAGE_READER, CALCULATOR
 from app.tools.web_search import web_search
 from app.tools.page_reader import read_page
 from app.tools.calculator import calculate, CalculatorError
