@@ -1,4 +1,4 @@
-# ResearchPilot (Phase 5 — structured report generation)
+# ResearchPilot (Phase 6 — persistent memory)
 
 An autonomous web research and report-generation agent. Phase 1 was a
 linear **PLAN → ACT → OBSERVE → UPDATE STATE → FINAL** pipeline. Phase 2
@@ -11,17 +11,22 @@ going through web search. Phase 4 extended the evaluator into a fuller
 **critic**: on top of the coverage check, it also flags quality issues
 (unsupported claims, irrelevant/off-topic sources) as structured
 `issues`/`recommended_action` output, surfaced (but not yet acted on
-beyond coverage) each pass. Phase 5 replaces the plain synthesized
+beyond coverage) each pass. Phase 5 replaced the plain synthesized
 answer with a **structured, multi-section report** (Executive Summary,
 Research Question, Methodology, Key Findings, Comparison / Analysis,
-Limitations, Sources) — see "Report format" below. Persistent memory
-and a separate evaluation module are **not** implemented yet — they
-come in Phases 6 and 7.
+Limitations, Sources) — see "Report format" below. Phase 6 adds
+**lightweight persistent memory**: every run's queries, successes,
+failures and useful source domains are saved to a small JSON file, and
+the planner retrieves related past runs before building a new plan — see
+"Memory" below. A separate evaluation module is **not** implemented yet
+— it comes in Phase 7.
 
 ## What it does right now
 
 1. You give it a research question via the CLI.
-2. **Planner** (LLM) breaks it into 3–5 concrete research steps.
+2. **Planner** (LLM) retrieves any related past runs from memory (see
+   "Memory" below) and breaks the goal into 3–5 concrete research steps,
+   using those past runs as hints where relevant.
 3. **Researcher** executes each *pending* step, routing it to the tool
    that fits it (see "Tools" below), and records findings + sources.
 4. **Evaluator / Critic** (LLM) checks whether the findings so far are
@@ -35,6 +40,8 @@ come in Phases 6 and 7.
 5. **Reporter** (LLM + deterministic assembly) synthesizes the findings
    into a structured, multi-section report — see "Report format" below.
 6. The report is saved to `output/` via the **report writer** tool.
+7. **Memory writer** saves this run's queries/sources to the JSON memory
+   store, for the *next* run's planner to draw on.
 
 ## Tools
 
@@ -60,8 +67,8 @@ Orchestration is a LangGraph graph with a conditional loop:
 START -> planner -> researcher -> evaluator ───────┘  (evidence insufficient,
                                        │                under iteration cap)
                                        ▼
-                                   reporter -> END      (evidence sufficient,
-                                                          or cap hit)
+                                   reporter -> memory_writer -> END
+                                    (evidence sufficient, or cap hit)
 ```
 
 The evaluator — not a fixed sequence — decides which branch to take each
@@ -120,6 +127,60 @@ report as-is (it only falls back to its old plain `# Research Report` /
 `**Goal:**` wrapper for a bare, unformatted body, kept for backward
 compatibility with earlier phases).
 
+## Memory
+
+`app/memory.py` implements the Phase 6 requirement: **previous
+experience → better planning/search strategy.** This is explicitly *not*
+model training and *not* a vector database — a single JSON file
+(`memory/agent_memory.json` by default, path configurable via
+`RESEARCHPILOT_MEMORY_PATH`) holding one small record per past run:
+
+```json
+{
+  "timestamp": "2026-09-27T12:00:00+00:00",
+  "goal": "What is the pricing for Acme Cloud?",
+  "successful_queries": ["Acme Cloud pricing"],
+  "failed_queries": ["Acme Cloud xyzzy nonsense"],
+  "useful_domains": ["acme.com"],
+  "iterations": 2,
+  "sufficient": true
+}
+```
+
+- **Writing** — the new `memory_writer` graph node runs once per
+  completed research run, right after the report is generated. It reads
+  `state.tool_history` to split `web_search` calls into
+  `successful_queries` (returned results) and `failed_queries` (errored
+  or found nothing — calculator/page_reader calls aren't queries and are
+  excluded), reads `state.sources` for de-duplicated source *domains*
+  (not full URLs), and appends the record to the store.
+- **Retrieval** — before the planner LLM call, `app.memory.get_planning_hint`
+  tokenizes the new goal (lowercased words, minus a small stopword list)
+  and scores every past run's goal by keyword overlap. The top few
+  overlapping runs (default 3) are rendered as a short "hints only, not
+  facts" block and appended to the planner prompt — the LLM is
+  explicitly told to prefer phrasings that worked before and avoid ones
+  that failed, but still plan from the *current* goal. No overlap means
+  no hint block is added, and the planner behaves exactly as it did
+  pre-Phase-6.
+- **Failure handling** — a missing or corrupt memory file is treated as
+  an empty store (logged, not raised); a fresh run is never blocked by a
+  broken memory file.
+
+This intentionally does not do user-feedback storage: nothing in the
+current CLI collects feedback on a finished report, and Phase 6's rule
+is "do not invent functionality that is not implemented" — so that part
+of the target schema is left out rather than stubbed with fake data.
+
+> **Note on updates:** every zip/patch delivered for this project omits
+> your real `memory/agent_memory.json` on purpose — it's local run
+> history, not shipped code (see `.gitignore`). If you extract a new
+> zip on top of this project, make sure your extraction step *merges*
+> into the existing `memory/` folder rather than replacing it wholesale,
+> or you'll silently lose accumulated run history (the code will just
+> treat it as a fresh, empty store — no error, no crash, nothing to
+> indicate anything was lost).
+
 ## Project structure
 
 ```
@@ -134,8 +195,10 @@ researchpilot/
 │   ├── tool_selector.py  # NEW (Phase 3): decides web_search / page_reader / calculator
 │   ├── evaluator.py      # coverage + quality critic; routing decision (can
 │   │                     #   propose a URL to read, or a calculation)
-│   ├── reporter.py       # UPDATED (Phase 5): structured multi-section report
-│   │                     #   (see "Report format" above), not just a plain answer
+│   ├── reporter.py       # structured multi-section report (see "Report
+│   │                     #   format" above), not just a plain answer
+│   ├── memory.py         # NEW (Phase 6): JSON-backed run history +
+│   │                     #   keyword-overlap retrieval (see "Memory" above)
 │   └── tools/
 │       ├── web_search.py
 │       ├── page_reader.py    # fetch + extract text from one URL
@@ -144,6 +207,7 @@ researchpilot/
 │                              #   compatible with a bare, unformatted body)
 ├── tests/
 ├── output/                # generated reports land here
+├── memory/                 # NEW (Phase 6): agent_memory.json lands here
 ├── .env.example
 ├── requirements.txt
 └── README.md
@@ -185,6 +249,7 @@ file under `output/`.
 | `GROQ_REQUESTS_PER_MINUTE` | Client-side throttle for Groq calls (default `25`). See "Rate limiting" below. |
 | `ANTHROPIC_API_KEY` | Your Anthropic API key. Only required when `LLM_PROVIDER=anthropic`. |
 | `RESEARCHPILOT_MAX_ITERATIONS` | Max research/evaluate loop iterations before forcing a report (default `3`). Prevents infinite loops. |
+| `RESEARCHPILOT_MEMORY_PATH` | Path to the JSON memory store (default `memory/agent_memory.json`). See "Memory" above. |
 
 ### Rate limiting (Groq)
 
@@ -211,24 +276,102 @@ python -m pytest tests/ -v
 
 `tests/test_mvp.py` (Phase 1), `tests/test_phase2.py` (Phase 2),
 `tests/test_phase3.py` (Phase 3), `tests/test_phase4.py` (Phase 4), and
-`tests/test_phase5.py` (Phase 5, new) cover `AgentState`, all four tools
-(`calculator`, `page_reader`, `report_writer`, and `web_search` indirectly
-via the researcher), JSON-extraction (planner + evaluator), the
-evaluator/critic's routing decision, iteration cap, and quality-`issues`
-surfacing, `tool_selector.choose_tool` for every step shape, the
-researcher's dedup and tool-routing logic, and `generate_report`'s section
-parsing/assembly (order, deterministic Methodology/Sources/Research
-Question content, the no-findings and malformed-LLM-output fallbacks) —
-all without needing network access or an API key (`requests.get` /
-`web_search` / `read_page` / the LLM client are monkeypatched out
-wherever a test would otherwise need the network; `write_report` is
-exercised for real against a `tmp_path`, since it's a pure filesystem op
-that's safe to run anywhere). They do **not** cover live LLM calls or
-live web search themselves, since those need real credentials and open
-internet access; verify those manually with `python -m app.main "..."`
-(see "How this was tested" below).
+`tests/test_phase5.py` (Phase 5), and `tests/test_phase6.py` (Phase 6,
+new) cover `AgentState`, all four tools (`calculator`, `page_reader`,
+`report_writer`, and `web_search` indirectly via the researcher),
+JSON-extraction (planner + evaluator), the evaluator/critic's routing
+decision, iteration cap, and quality-`issues` surfacing,
+`tool_selector.choose_tool` for every step shape, the researcher's dedup
+and tool-routing logic, `generate_report`'s section parsing/assembly
+(order, deterministic Methodology/Sources/Research Question content, the
+no-findings and malformed-LLM-output fallbacks), and `app/memory.py`'s
+store load/save/corrupt-file handling, `record_run`'s
+successful/failed-query split and domain de-duplication,
+`retrieve_relevant_experience`'s keyword-overlap matching, and the
+planner's inclusion (or graceful omission) of a memory hint in its
+prompt — all without needing network access or an API key
+(`requests.get` / `web_search` / `read_page` / the LLM client are
+monkeypatched out wherever a test would otherwise need the network;
+`write_report` and the memory store's file I/O are exercised for real
+against a `tmp_path`, since both are pure filesystem ops safe to run
+anywhere). They do **not** cover live LLM calls or live web search
+themselves, since those need real credentials and open internet access;
+verify those manually with `python -m app.main "..."` (see "How this was
+tested" below).
 
 ## How this was tested
+
+### Phase 6
+
+Confirmed on the user's own machine (Windows, Python 3.14.7,
+`pytest-9.1.1`, real `pydantic`/`langgraph`/`anthropic`/`groq`
+installed), superseding the offline-shimmed checks described below:
+- `python -m pytest tests/ -v`: **79/79 passed**, including all 20
+  `tests/test_phase6.py` tests, with zero regressions in
+  `test_mvp.py`/`test_phase2-5.py`.
+- A live `python -m app.main "What is the current pricing for
+  Anthropic's Claude API, including the newest models?"` run confirmed
+  the whole Phase 6 wiring end-to-end against real network + LLM calls:
+  - `[MEMORY] No related past runs found.` on this first-ever run (empty
+    store), and `[MEMORY] Saved this run's queries/sources for future
+    planning.` after the report — `memory/agent_memory.json` now holds
+    one record. A second, related run of the same question then logged
+    `[MEMORY] Found 1 related past run(s) — adding hints to the plan
+    prompt.`, confirming `retrieve_relevant_experience`'s keyword-overlap
+    match actually fires against a real on-disk store, not just the
+    offline harness below — closing the one gap noted after the first
+    live run.
+  - The `reporter -> memory_writer -> END` edge ran cleanly as part of a
+    real `build_graph()` invocation — not just something exercised via a
+    dataclass stand-in.
+  - The critic/evaluator loop ran for the full 4 iterations (3 more
+    passes + the max-iteration cutoff), each time correctly flagging
+    quality issues — reliance on third-party price-aggregator sources
+    (`llmpricecheck.com`, `pricepertoken.com`, `coursiv.io`,
+    `claudelab.net`), and unverified/undated figures — without those
+    issues alone forcing endless re-search once coverage looked
+    sufficient. This is exactly the documented Phase 5 limitation in
+    practice: *"the critic doesn't yet re-route research specifically to
+    resolve a quality issue that isn't also a coverage gap"* — worth
+    keeping in mind when reading a report's numbers, since a flagged
+    quality issue doesn't block the report from citing that source.
+
+What was *not* re-verified by these real runs (still only checked via
+the offline harness below, or not applicable to these queries): the
+missing-file/corrupt-JSON fallback paths in `load_memory` (no corrupt
+file occurred during a normal run).
+
+<details>
+<summary>Original offline validation (before the real run above)</summary>
+
+This environment (used to build Phase 6) had no network access
+(`pip install -r requirements.txt` could not run — no `pydantic`,
+`langgraph`, etc.) and no LLM/API credentials. What was actually
+*executed* there:
+- `python -m py_compile` on every touched file (`app/memory.py`,
+  `app/planner.py`, `app/graph.py`, and the new `tests/test_phase6.py`):
+  clean.
+- `app/memory.py`'s real code — `load_memory`/`save_memory` (including
+  the missing-file and corrupt-JSON fallback paths), `record_run` (the
+  successful/failed `web_search`-query split, domain de-duplication from
+  `state.sources`, the `sufficient` default when `state.critique` is
+  `None`), `retrieve_relevant_experience` (keyword-overlap scoring and
+  the `max_runs` cap), `format_memory_hint`, and `get_planning_hint` —
+  was run directly against real temp-file paths via a standalone
+  harness, using a small dataclass-based stand-in for `app.state`'s
+  `AgentState`/`Source`/`ToolCallRecord` (since real `pydantic` wasn't
+  installable offline there, the same constraint Phase 5 hit). Every
+  assertion from `tests/test_phase6.py`'s equivalent scenarios was
+  checked this way and passed, including the "persists across separate
+  record/retrieve calls" case.
+- `app/planner.py`'s actual `plan()` function was exercised the same way
+  (real `app.planner` module, `app.state`/`app.llm_provider` stubbed),
+  confirming the memory hint text is folded into the LLM prompt when a
+  related past run exists, and that the prompt is byte-identical to the
+  pre-Phase-6 form (`"Research goal: {goal}"`, no trailing hint section)
+  when nothing relevant is found.
+
+</details>
 
 ### Phase 5
 
@@ -312,7 +455,7 @@ compare to the free plan's limits?", so you can watch [TOOL] web_search,
 [TOOL] calculator, and potentially [TOOL] page_reader all fire in one
 run.
 
-## Known limitations (Phase 5 stage, expected)
+## Known limitations (Phase 6 stage, expected)
 
 - The critic's quality `issues` (unsupported claims, off-topic sources)
   are surfaced in the report's Limitations section, but don't otherwise
@@ -336,7 +479,20 @@ run.
   fine for typical article/pricing pages and text-based PDFs, but it
   won't get useful text from a heavily JavaScript-rendered page or a
   scanned/image-only PDF with no text layer (no OCR).
-- No persistent memory across runs yet (Phase 6) — no previous-topic
-  reuse, no learning from past successful/failed search patterns.
+- Memory retrieval is plain keyword overlap on goal text, not semantic
+  similarity — a related goal phrased with entirely different words
+  (e.g. "Notion cost" vs. "How much do I pay for a workspace tool") won't
+  match. No embeddings/vector store, per Phase 6's "do not build a
+  complex vector database unless actually necessary."
+- Memory only records `web_search` queries as successful/failed;
+  `page_reader`/`calculator` calls aren't queries and aren't stored as
+  search patterns, so a run driven mostly by page-reading leaves fewer
+  hints for next time.
+- No user-feedback storage — the CLI doesn't currently collect feedback
+  on a finished report, so that part of the Phase 6 schema is left out
+  rather than faked (see "Memory" above).
+- The memory store is a single flat JSON file with no size cap or
+  pruning — fine at prototype/contest scale, but it will grow unbounded
+  over many real runs.
 - No separate evaluation module yet (Phase 7) — no deterministic
   relevance/coverage/completeness scoring of a finished run.
