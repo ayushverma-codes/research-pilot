@@ -1,147 +1,218 @@
-# ResearchPilot (Phase 8 — guardrails + failure handling)
+# ResearchPilot
 
-An autonomous web research and report-generation agent. Phase 1 was a
-linear **PLAN → ACT → OBSERVE → UPDATE STATE → FINAL** pipeline. Phase 2
-added a genuine conditional loop: an LLM-driven evaluator decides, after
-each research pass, whether there's enough evidence to report or whether
-more research is needed. Phase 3 added two more tools (a page reader and
-a report-file writer) and real **tool selection**: each plan step is
-routed to the tool that fits its shape, instead of every step always
-going through web search. Phase 4 extended the evaluator into a fuller
-**critic**: on top of the coverage check, it also flags quality issues
-(unsupported claims, irrelevant/off-topic sources) as structured
-`issues`/`recommended_action` output, surfaced (but not yet acted on
-beyond coverage) each pass. Phase 5 replaced the plain synthesized
-answer with a **structured, multi-section report** (Executive Summary,
-Research Question, Methodology, Key Findings, Comparison / Analysis,
-Limitations, Sources) — see "Report format" below. Phase 6 adds
-**lightweight persistent memory**: every run's queries, successes,
-failures and useful source domains are saved to a small JSON file, and
-the planner retrieves related past runs before building a new plan — see
-"Memory" below. Phase 7 added a separate deterministic evaluation module
-for completed runs (`app/evaluation.py`, `python -m app.evaluate`) — see
-"Evaluation" below. Phase 8 adds explicit **guardrails**: input
-validation on the raw task before any LLM/tool call is made, and outbound
-URL validation on `page_reader` (blocked schemes, loopback/private/
-link-local targets) — see "Guardrails" below. Everything else Phase 8
-calls for (API/search failure, timeouts, malformed LLM JSON, max
-iterations, missing sources, unsupported claims, empty report) was
-already handled at the point it happens in earlier phases; Phase 8 did
-not duplicate that, only closed the two gaps that remained.
+An autonomous web research and report-generation agent, built as an AI Agentic
+System contest submission. Give it a plain-language research question; it
+plans its own research steps, uses real tools to gather evidence, critiques
+its own findings, re-plans when the evidence is thin, and writes a structured
+Markdown report — grounded only in what it actually found.
 
-## What it does right now
+---
 
-1. You give it a research question via the CLI.
-2. **Planner** (LLM) retrieves any related past runs from memory (see
-   "Memory" below) and breaks the goal into 3–5 concrete research steps,
-   using those past runs as hints where relevant.
-3. **Researcher** executes each *pending* step, routing it to the tool
-   that fits it (see "Tools" below), and records findings + sources.
-4. **Evaluator / Critic** (LLM) checks whether the findings so far are
-   enough to answer the goal, *and* flags quality issues (unsupported
-   claims, off-topic sources) as structured `issues`. If coverage is
-   insufficient, it proposes 1–3 next actions — usually a new search
-   query, but it can also point at a specific source URL to read in
-   depth, or a calculation to run — and the plan is extended, routing
-   back to the researcher. If sufficient (or the iteration cap is hit),
-   it moves on.
-5. **Reporter** (LLM + deterministic assembly) synthesizes the findings
-   into a structured, multi-section report — see "Report format" below.
-6. The report is saved to `output/` via the **report writer** tool.
-7. **Memory writer** saves this run's queries/sources to the JSON memory
-   store, for the *next* run's planner to draw on.
+## Table of contents
+
+1. [Problem statement](#problem-statement)
+2. [Motivation](#motivation)
+3. [Solution overview](#solution-overview)
+4. [Architecture](#architecture)
+5. [Agent workflow](#agent-workflow)
+6. [Tools](#tools)
+7. [State management](#state-management)
+8. [Agentic loop](#agentic-loop)
+9. [Memory / learning](#memory--learning)
+10. [Evaluation](#evaluation)
+11. [Project structure](#project-structure)
+12. [Installation](#installation)
+13. [Environment variables](#environment-variables-env)
+14. [Running instructions](#running-instructions)
+15. [Example input](#example-input)
+16. [Example output](#example-output)
+17. [Failure handling](#failure-handling)
+18. [Limitations](#limitations)
+19. [Future improvements](#future-improvements)
+20. [Testing](#testing)
+
+---
+
+## Problem statement
+
+Answering a non-trivial research question well — "what's the current pricing
+for X, including its newest models?", "how does A compare to B on Y and Z?" —
+usually means several rounds of searching, opening multiple pages, checking
+whether what you found is actually current and consistent, and then writing
+it up clearly with sources. Doing this by hand is slow and easy to do
+sloppily: it's tempting to stop after the first plausible-looking answer
+instead of verifying it.
+
+## Motivation
+
+The contest asks for a genuinely agentic system: something that plans a task,
+uses an LLM to decide actions, calls real tools, keeps state across steps,
+observes results, re-plans when necessary, and produces one coherent final
+answer — not a single fixed prompt-and-response. ResearchPilot was chosen as
+the project because autonomous research is a natural fit for exactly that
+loop: a single search is rarely enough evidence, so the system has a real
+reason to look at what it found, judge whether it's enough, and go back for
+more when it isn't.
+
+## Solution overview
+
+ResearchPilot is a CLI agent, orchestrated as a [LangGraph](https://github.com/langchain-ai/langgraph)
+state graph, that:
+
+1. Takes a research question from the command line (or an interactive prompt).
+2. **Plans** 3–5 concrete research steps with an LLM, informed by hints from
+   related past runs (see [Memory](#memory--learning)).
+3. **Researches** each pending step by routing it to the tool that fits it —
+   web search, a specific page/PDF to read, or a calculation.
+4. **Critiques** the evidence gathered so far with an LLM: is it enough to
+   answer the question, and are there quality problems (unsupported claims,
+   off-topic sources)? If not, it queues more research and loops back to
+   step 3 — bounded by a hard iteration cap.
+5. **Reports**: writes a structured, multi-section Markdown report,
+   distinguishing facts from analysis, and never claiming research happened
+   that didn't.
+6. **Remembers**: saves this run's successful/failed queries and useful
+   source domains to a small JSON store, so the next related run's planner
+   starts with a head start.
+
+Every stage prints a concise, human-readable trace line as it runs (no
+hidden chain-of-thought), so the whole loop is visible and explainable while
+it executes.
+
+## Architecture
+
+```mermaid
+flowchart TD
+    START(["START"]) --> Planner["Planner\n(LLM: goal -> 3-5 step plan,\ninformed by memory hints)"]
+    Planner --> Researcher["Researcher\n(routes each pending step to\nweb_search / page_reader / calculator)"]
+    Researcher --> Evaluator{"Evaluator / Critic\n(LLM: coverage + quality check)"}
+    Evaluator -->|"insufficient evidence\n& under iteration cap"| Researcher
+    Evaluator -->|"sufficient, or\niteration cap hit"| Reporter["Reporter\n(LLM narrative + deterministic\nsection assembly)"]
+    Reporter --> MemoryWriter["Memory Writer\n(persists this run's queries\n/ sources to JSON store)"]
+    MemoryWriter --> END(["END"])
+```
+
+Five nodes, one shared `AgentState` object flowing through all of them, and
+one conditional edge (`needs_more_research`, in `app/evaluator.py`) that
+decides — based on current state, not a fixed script — whether to loop back
+to research or move on to reporting. `app/graph.py` wires this exact graph
+with LangGraph's `StateGraph`.
+
+## Agent workflow
+
+```
+USER TASK
+   |
+   v
+PLAN  ---------------------------->  Researcher picks 3-5 concrete steps
+   |
+   v
+ACT (tool call)  ------------------> web_search / page_reader / calculator
+   |
+   v
+OBSERVE  --------------------------> tool result recorded
+   |
+   v
+STATE UPDATE  ----------------------> findings / sources / tool_history grow
+   |
+   v
+CRITIC (evidence check)  ----------> sufficient? quality issues?
+   |
+   +--- No (insufficient, under cap) --> back to ACT with new steps
+   |
+   v
+FINAL REPORT  ----------------------> structured Markdown, saved to output/
+```
+
+This is a real conditional loop, not a fixed sequence: the number of
+research passes is decided by the critic's own judgment of the evidence
+each time, bounded by `RESEARCHPILOT_MAX_ITERATIONS` (default `3`) so a
+stubborn or ambiguous goal can never run forever.
 
 ## Tools
 
 | Tool | File | Used for |
 |---|---|---|
 | `web_search` | `app/tools/web_search.py` | The default: a general research question. DuckDuckGo HTML endpoint, no API key needed. |
-| `page_reader` | `app/tools/page_reader.py` | A step that names a specific URL — fetches the page and extracts its readable text, going deeper than a search snippet. Handles both HTML pages and PDF documents (many official pricing/spec sources are PDFs), detected by Content-Type header or `.pdf` URL suffix. |
-| `calculator` | `app/tools/calculator.py` | A step that is, or asks for, an arithmetic calculation (e.g. `"Calculate: 49.99 * 12"`). Safe `ast`-based evaluation, no `eval`. |
+| `page_reader` | `app/tools/page_reader.py` | A step that names a specific URL — fetches the page and extracts its readable text, going deeper than a search snippet. Handles both HTML pages and PDF documents, detected by `Content-Type` header or `.pdf` URL suffix. |
+| `calculator` | `app/tools/calculator.py` | A step that is, or asks for, an arithmetic calculation (e.g. `"Calculate: 49.99 * 12"`). Safe `ast`-based evaluation — never `eval`. |
 | `report_writer` | `app/tools/report_writer.py` | Saves the finished report to `output/` with a timestamped filename. |
 
-`app/tool_selector.py` decides which of `web_search` / `page_reader` /
-`calculator` handles a given step, from the step's shape (does it contain
-a URL? is it a bare arithmetic expression or `"Calculate: ..."`?) — see
-"Tool selection" below for why this is deterministic rather than another
-LLM call.
-
-Orchestration is a LangGraph graph with a conditional loop:
+`app/tool_selector.py` decides which tool handles a given step, from the
+step's shape — deliberately simple pattern matching, not a second LLM call
+per step:
 
 ```
-                         ┌────────────────────────┐
-                         │                         │
-                         ▼                         │
-START -> planner -> researcher -> evaluator ───────┘  (evidence insufficient,
-                                       │                under iteration cap)
-                                       ▼
-                                   reporter -> memory_writer -> END
-                                    (evidence sufficient, or cap hit)
-```
-
-The evaluator — not a fixed sequence — decides which branch to take each
-time, based on current state (findings so far, what's already been
-searched, iteration count). See `app/evaluator.py`.
-
-### Tool selection
-
-Inside the researcher node, each pending step is routed to a tool by
-`app.tool_selector.choose_tool`:
-
-```
-step contains a URL                        -> page_reader
+step contains a URL                         -> page_reader
 step is/asks for an arithmetic calculation  -> calculator
 otherwise (the common case)                 -> web_search
 ```
 
-This is deliberately simple pattern matching, not a second LLM call per
-step. The *decision about what work is needed* (a new search? a specific
-source read in depth? a calculation?) is already made by the LLM-driven
-evaluator in Phase 2 — it just expresses that decision as plain text
-(a search query, a URL, or `"Calculate: <expr>"`). Tool selection only has
-to figure out *how to execute* whatever text it's given, which a few
-regexes do reliably and for free, keeping the loop explainable and fast.
+The *decision about what work is needed* (a new search? a specific source
+read in depth? a calculation?) is already made by the LLM-driven evaluator;
+tool selection only figures out *how to execute* the text it's given.
 
-## Report format
+## State management
 
-`app/reporter.py` assembles the final report from two sources, never just
-one:
+A single Pydantic model, `AgentState` (`app/state.py`), flows through every
+node. Each node reads from it and returns a partial update — this is what
+makes the pipeline explainable, loggable, and easy to test in isolation.
 
-- **Deterministic sections** — built directly from `state`, so they can
-  never claim work that didn't happen: `Research Question` (the literal
-  `user_goal`), `Methodology` (iteration count, tool-call counts by type,
-  step count, and the critic's final `recommended_action`, all read from
-  `state.tool_history`/`state.iteration`/`state.critique`), and `Sources`
-  (every gathered source, de-duplicated by URL).
-- **LLM-written sections** — one reporter call returns exactly four
-  markdown sections (`Executive Summary`, `Key Findings`,
-  `Comparison / Analysis`, `Limitations`), which are parsed out by
-  heading and slotted into place. `Key Findings` is restricted to facts
-  actually present in `state.findings`; interpretation/synthesis is kept
-  separate in `Comparison / Analysis`, so facts and analysis are never
-  mixed in one block. The LLM's `Limitations` bullets are appended after
-  deterministic ones (any `state.missing_information` left over, and any
-  quality `issues` the critic raised) — so a run's real gaps are always
-  reported even if the LLM's own guess at limitations is thin.
-- If the LLM doesn't follow the requested heading format, its whole
-  reply is kept (as the Executive Summary) rather than silently dropped.
-- If a run gathered no findings/sources at all, that's stated explicitly
-  in `Limitations` rather than the report guessing at an answer.
+```python
+class AgentState(BaseModel):
+    user_goal: str
 
-Final section order: `Executive Summary → Research Question →
-Methodology → Key Findings → Comparison / Analysis → Limitations →
-Sources`. `app/tools/report_writer.py` writes this already-complete
-report as-is (it only falls back to its old plain `# Research Report` /
-`**Goal:**` wrapper for a bare, unformatted body, kept for backward
-compatibility with earlier phases).
+    # planning
+    plan: List[str]
+    current_step: int
+    completed_steps: List[str]
 
-## Memory
+    # research results
+    findings: List[str]
+    sources: List[Source]                # url, title, snippet
+    missing_information: List[str]
 
-`app/memory.py` implements the Phase 6 requirement: **previous
-experience → better planning/search strategy.** This is explicitly *not*
-model training and *not* a vector database — a single JSON file
-(`memory/agent_memory.json` by default, path configurable via
-`RESEARCHPILOT_MEMORY_PATH`) holding one small record per past run:
+    # bookkeeping
+    tool_history: List[ToolCallRecord]   # tool, input, success, summary
+    critique: Optional[Dict[str, Any]]   # sufficient, missing_information, issues, recommended_action
+    iteration: int
+
+    # output
+    final_report: str
+```
+
+## Agentic loop
+
+The loop is genuinely conditional, not a fixed sequence — the LLM decides
+the next action based on state, per node:
+
+- **Researcher** only processes steps not already in `completed_steps`, so
+  the plan can grow between passes without redoing work.
+- **Evaluator / Critic** (`app/evaluator.py`) reads `state.findings` and
+  `state.sources`, asks an LLM whether that's enough evidence, and returns:
+  - `sufficient: true/false`
+  - `missing_information`: human-readable gaps (for the report's Limitations)
+  - `additional_queries`: new steps to append to the plan (only used when
+    `sufficient` is false) — never a query already planned or completed, and
+    never a URL the LLM invented rather than copied from a known source
+    (`_drop_hallucinated_urls`).
+  - `issues` / `recommended_action`: quality flags (unsupported claims,
+    off-topic sources), surfaced in the report regardless of coverage.
+- **Router** (`needs_more_research`) sends the graph back to `researcher` if
+  `missing_information` is non-empty *and* the iteration cap hasn't been
+  hit; otherwise it moves on to `reporter`. Once `RESEARCHPILOT_MAX_ITERATIONS`
+  is reached, the critic is not called again at all — the loop is bounded by
+  a check, not by hoping the LLM eventually says "sufficient."
+- If the critic's own LLM call fails or times out, the code never marks
+  evidence sufficient just to move on — see [Failure handling](#failure-handling).
+
+## Memory / learning
+
+`app/memory.py` implements **previous experience → better planning/search
+strategy**. This is explicitly *not* model training and *not* a vector
+database — a single JSON file (`memory/agent_memory.json` by default, path
+configurable via `RESEARCHPILOT_MEMORY_PATH`) holding one small record per
+past run:
 
 ```json
 {
@@ -155,89 +226,62 @@ model training and *not* a vector database — a single JSON file
 }
 ```
 
-- **Writing** — the new `memory_writer` graph node runs once per
-  completed research run, right after the report is generated. It reads
-  `state.tool_history` to split `web_search` calls into
-  `successful_queries` (returned results) and `failed_queries` (errored
-  or found nothing — calculator/page_reader calls aren't queries and are
-  excluded), reads `state.sources` for de-duplicated source *domains*
-  (not full URLs), and appends the record to the store.
-- **Retrieval** — before the planner LLM call, `app.memory.get_planning_hint`
-  tokenizes the new goal (lowercased words, minus a small stopword list)
-  and scores every past run's goal by keyword overlap. The top few
-  overlapping runs (default 3) are rendered as a short "hints only, not
-  facts" block and appended to the planner prompt — the LLM is
-  explicitly told to prefer phrasings that worked before and avoid ones
-  that failed, but still plan from the *current* goal. No overlap means
-  no hint block is added, and the planner behaves exactly as it did
-  pre-Phase-6.
-- **Failure handling** — a missing or corrupt memory file is treated as
-  an empty store (logged, not raised); a fresh run is never blocked by a
-  broken memory file.
+- **Writing** — the `memory_writer` graph node runs once per completed run,
+  right after the report is generated. It splits `web_search` calls into
+  `successful_queries` / `failed_queries` from `state.tool_history`, records
+  de-duplicated source *domains* from `state.sources`, and appends the
+  record to the store.
+- **Retrieval** — before the planner's LLM call, `get_planning_hint`
+  tokenizes the new goal and scores past runs by keyword overlap. The
+  top few overlapping runs are rendered as a short "hints only, not facts"
+  block appended to the planner prompt — the LLM is told to prefer
+  phrasings that worked before and avoid ones that failed, but still plan
+  from the *current* goal. No overlap means no hint block is added.
+- **Failure handling** — a missing or corrupt memory file is treated as an
+  empty store (logged, not raised); a fresh run is never blocked by it.
 
-This intentionally does not do user-feedback storage: nothing in the
-current CLI collects feedback on a finished report, and Phase 6's rule
-is "do not invent functionality that is not implemented" — so that part
-of the target schema is left out rather than stubbed with fake data.
+This intentionally does not do user-feedback storage, since nothing in the
+current CLI collects feedback on a finished report — that part of a fuller
+memory schema is left out rather than stubbed with fake data.
 
-> **Note on updates:** every zip/patch delivered for this project omits
-> your real `memory/agent_memory.json` on purpose — it's local run
-> history, not shipped code (see `.gitignore`). If you extract a new
-> zip on top of this project, make sure your extraction step *merges*
-> into the existing `memory/` folder rather than replacing it wholesale,
-> or you'll silently lose accumulated run history (the code will just
-> treat it as a fresh, empty store — no error, no crash, nothing to
-> indicate anything was lost).
+> **Note on updates:** the project zip does not include your real
+> `memory/agent_memory.json` — it's local run history, not shipped code
+> (see `.gitignore`). If you extract a new zip on top of this project,
+> merge into your existing `memory/` folder rather than replacing it, or
+> you'll lose accumulated run history (no error — it'll just look like a
+> fresh, empty store).
 
-## Evaluation (Phase 7)
+## Evaluation
 
-Phase 7 adds a separate deterministic evaluation layer for **completed**
-research runs. It does not replace or modify the Phase 4 in-loop critic in
-`app/evaluator.py`; the benchmark logic lives in `app/evaluation.py`, and
-`python -m app.evaluate` runs a fixed fixture suite from
-`app/evaluation_data/phase7_cases.json`.
-
-The evaluator only uses observable artifacts (`user_goal`, `findings`,
-`sources`, `iteration`, `missing_information`, and `final_report`). It never
-reads or exposes hidden chain-of-thought, and it makes no LLM call by default.
-The five reported 0.0-1.0 metrics are:
-
-- **Task relevance** — fraction of meaningful task terms that appear in the
-  final report. This is lexical coverage, not semantic correctness.
-- **Completeness** — deterministic checks for findings, sources, executive
-  summary, limitations, no unresolved `missing_information`, and termination
-  within the allowed iteration limit.
-- **Source coverage** — mean of URL recall and precision between collected
-  `state.sources` and URLs actually cited in the report; unknown report URLs
-  are flagged.
-- **Grounding / evidence support** — checks `Key Findings` bullets against
-  gathered findings/source metadata using a transparent lexical-overlap
-  heuristic (>= 0.50). Weakly supported bullets are listed as warnings. This
-  is not factual entailment or proof that a claim is true.
-- **Report structure / format** — presence of all seven required Phase 5
-  sections.
-
-`overall` is the unweighted arithmetic mean of those five diagnostic scores.
-No score is treated as objective ground truth. An optional LLM judge is not
-needed for the current suite; if added later, it should remain a clearly
-separate supplemental signal rather than overwrite deterministic metrics.
-
-Run it with:
+`app/evaluation.py` is a **separate, deterministic** evaluation layer for
+*completed* runs — it does not replace or modify the in-loop critic. Run it
+with:
 
 ```bash
 python -m app.evaluate
 ```
 
-Each run prints a concise aggregate/per-case summary and saves the full JSON
-result under `output/evaluations/evaluation_<timestamp>.json`. The fixture
-dataset covers simple factual research, a multi-entity comparison, a task
-requiring an additional calculation/research step, and intentionally limited
-evidence.
+It evaluates only observable artifacts (`user_goal`, `findings`, `sources`,
+`iteration`, `missing_information`, `final_report`) against a fixed fixture
+suite (`app/evaluation_data/phase7_cases.json`), with no LLM call by default.
+Five 0.0–1.0 metrics, each a transparent deterministic check, not a claim of
+objective truth:
 
-### Phase 7 sample results
+| Metric | What it checks |
+|---|---|
+| **Relevance** | Fraction of meaningful task terms present in the final report (lexical, not semantic). |
+| **Completeness** | Findings/sources/executive-summary/limitations present, no unresolved `missing_information`, terminated within the iteration limit. |
+| **Source coverage** | Recall/precision between collected `state.sources` and URLs actually cited in the report. |
+| **Grounding** | `Key Findings` bullets checked against gathered findings/source metadata via lexical overlap (≥ 0.50); weak matches are warned, not hard-failed. |
+| **Format quality** | All seven required report sections present. |
 
-Actual output from the deterministic fixture suite in this implementation
-(4 cases):
+`overall` is the unweighted mean of the five. Each run prints an
+aggregate/per-case summary and saves full results to
+`output/evaluations/evaluation_<timestamp>.json`.
+
+**Actual output from this implementation's fixture suite** (4 cases:
+simple factual, multi-entity comparison, a task needing additional
+research, and intentionally limited evidence):
 
 | Metric | Score |
 |---|---:|
@@ -246,91 +290,40 @@ Actual output from the deterministic fixture suite in this implementation
 | Source coverage | 1.0000 |
 | Grounding | 0.9167 |
 | Format quality | 1.0000 |
-| Overall | 0.9750 |
+| **Overall** | **0.9750** |
 
-Per-case overall scores from the same run: `simple_factual=1.0000`,
-`multi_entity_comparison=1.0000`, `additional_research=0.9333`, and
-`limited_evidence=0.9667`. These are **fixture-suite diagnostics**, not a
-live-web benchmark, not a claim that the agent improved, and not a guarantee
-that future/live research will achieve the same values.
-
-## Guardrails (Phase 8)
-
-Phase 8 is deliberately scoped to the gaps that weren't already covered.
-Most of "guardrails + failure handling" was already load-bearing
-functionality from earlier phases:
-
-| Failure mode | Where it's actually handled |
-|---|---|
-| API failure / provider timeout | `app/llm_provider.py` (`LLMError`, `_run_with_hard_timeout`, Groq rate-limit retry) |
-| Search / page-read failure | `app/researcher.py`'s per-tool `try/except`, turned into a findings note instead of a crash |
-| Malformed LLM JSON (plan or critique) | `app/planner.py` / `app/evaluator.py` (`_extract_json_array` / `_extract_json_object`, with the critic's one bounded retry) |
-| Invalid calculator input | `app/tools/calculator.py` (`ast`-based evaluator, raises `CalculatorError` — never `eval`) |
-| Maximum iterations | `app/evaluator.py` (`RESEARCHPILOT_MAX_ITERATIONS`, enforced before any further LLM call) |
-| Missing sources / unsupported claims | `app/reporter.py`'s grounding gate (skips narrative synthesis when the critic didn't confirm sufficiency) and deterministic Limitations bullets |
-| Empty/failed report synthesis | `app/reporter.py`'s deterministic fallback narrative (evidence preserved, no invented conclusions) |
-
-What Phase 8 actually added, in `app/guardrails.py`:
-
-- **Input validation** (`validate_task`, used by `app/main.py` before the
-  graph is ever invoked): rejects an empty/whitespace-only task, a task
-  over 2000 characters (malformed/abusive input that would just blow up
-  every downstream prompt budget for no benefit), and a task with no
-  actual word characters at all (e.g. `"??? !!!"`) — not a real research
-  question in any recognizable sense.
-- **Outbound URL validation** (`validate_fetch_url`, wired into
-  `app/tools/page_reader.py::read_page`): `page_reader` is the one tool
-  argument in the system that is LLM/search-result influenced *and*
-  reaches outside the process (the calculator only evaluates arithmetic;
-  web_search only takes a query string), so it's the one real SSRF
-  surface. Blocked: any scheme other than `http`/`https` (e.g.
-  `file:///etc/passwd`), a URL with no host, and a host that is a literal
-  loopback/private/link-local/reserved/multicast IP or a known-local
-  hostname (`localhost`, cloud-metadata hostnames, etc.). Deliberately
-  does **not** perform DNS resolution — that would make the check a real
-  network call before `requests.get` even runs, and would break this
-  project's "tools are tested against canned responses, no real network
-  access" convention. It catches the common, cheap SSRF cases rather than
-  claiming to be a complete defense against DNS rebinding.
-- A defensive empty-report check in `app/main.py`, right before saving:
-  every current path through `app/reporter.py` already emits a
-  fully-headed report (with `"(no findings gathered)"`-style
-  placeholders when evidence is thin), so this should be unreachable —
-  it exists so a truly blank report is never silently written to disk.
+These are fixture-suite diagnostics, not a live-web benchmark or a claim
+that the agent "scored 97.5% accurate" in any general sense.
 
 ## Project structure
 
 ```
-researchpilot/
+research-pilot-main/
 ├── app/
-│   ├── main.py           # CLI entrypoint; saves report via report_writer tool
-│   ├── state.py          # shared Pydantic AgentState
-│   ├── llm_provider.py   # configurable LLM wrapper (Anthropic/Groq)
-│   ├── graph.py          # LangGraph wiring, incl. conditional loop
-│   ├── planner.py
-│   ├── researcher.py     # NEW (Phase 3): routes each step to a tool via tool_selector
-│   ├── tool_selector.py  # NEW (Phase 3): decides web_search / page_reader / calculator
-│   ├── evaluator.py      # Phase 4 in-loop coverage + quality critic / router
-│   ├── evaluation.py     # NEW (Phase 7): deterministic completed-run metrics
-│   ├── evaluate.py       # NEW (Phase 7): `python -m app.evaluate` suite CLI
+│   ├── main.py             # CLI entrypoint: banners, --demo flag, saves report
+│   ├── state.py             # shared Pydantic AgentState
+│   ├── llm_provider.py      # configurable LLM wrapper (Anthropic / Groq)
+│   ├── graph.py              # LangGraph wiring, incl. the conditional loop
+│   ├── planner.py             # LLM planning node (+ memory hint)
+│   ├── researcher.py           # routes each step to a tool; prints [STATE]
+│   ├── tool_selector.py         # decides web_search / page_reader / calculator
+│   ├── evaluator.py              # in-loop coverage + quality critic / router
+│   ├── evaluation.py              # deterministic completed-run metrics
+│   ├── evaluate.py                 # `python -m app.evaluate` suite CLI
 │   ├── evaluation_data/
-│   │   └── phase7_cases.json  # representative fixed evaluation fixtures
-│   ├── reporter.py       # structured multi-section report (see "Report
-│   │                     #   format" above), not just a plain answer
-│   ├── memory.py         # NEW (Phase 6): JSON-backed run history +
-│   │                     #   keyword-overlap retrieval (see "Memory" above)
-│   ├── guardrails.py     # NEW (Phase 8): input task validation +
-│   │                     #   page_reader URL/SSRF validation (see "Guardrails" above)
+│   │   └── phase7_cases.json        # fixed evaluation fixtures
+│   ├── reporter.py                   # structured multi-section report
+│   ├── memory.py                      # JSON-backed run history + retrieval
+│   ├── guardrails.py                   # input + outbound-URL validation
 │   └── tools/
 │       ├── web_search.py
-│       ├── page_reader.py    # fetch + extract text from one URL
-│       ├── calculator.py     # wired into the agent loop
-│       └── report_writer.py  # save the final report to output/ (backward-
-│                              #   compatible with a bare, unformatted body)
-├── tests/
-├── output/                # generated reports land here
-│   └── evaluations/       # Phase 7 timestamped evaluation JSON results
-├── memory/                 # NEW (Phase 6): agent_memory.json lands here
+│       ├── page_reader.py
+│       ├── calculator.py
+│       └── report_writer.py
+├── tests/                                # 122 tests, see "Testing" below
+├── output/                                # generated reports land here
+│   └── evaluations/                        # timestamped evaluation JSON
+├── memory/                                  # agent_memory.json lands here
 ├── .env.example
 ├── requirements.txt
 └── README.md
@@ -339,28 +332,13 @@ researchpilot/
 ## Installation
 
 ```bash
-cd researchpilot
+cd research-pilot-main
 python3 -m venv venv
 source venv/bin/activate        # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 cp .env.example .env
-# edit .env and set ANTHROPIC_API_KEY=sk-ant-...
+# edit .env and set GROQ_API_KEY=... (default provider) or ANTHROPIC_API_KEY=sk-ant-...
 ```
-
-## Running
-
-```bash
-python -m app.main "What are the key differences between PostgreSQL and MySQL for a high-write OLTP workload?"
-```
-
-or run it interactively (no args):
-
-```bash
-python -m app.main
-```
-
-Output is printed to the terminal and also saved as a timestamped Markdown
-file under `output/`.
 
 ## Environment variables (`.env`)
 
@@ -368,58 +346,168 @@ file under `output/`.
 |---|---|
 | `LLM_PROVIDER` | Which LLM backend to use: `groq` (default) or `anthropic`. |
 | `LLM_MODEL` | Model name passed to the provider SDK, e.g. `openai/gpt-oss-120b` (Groq) or `claude-sonnet-4-6` (Anthropic). |
-| `LLM_TIMEOUT_SECONDS` | Maximum duration for one provider request before it fails cleanly (default `60`). Prevents a stalled LLM request from hanging the agent indefinitely. |
+| `LLM_TIMEOUT_SECONDS` | Max duration for one provider request before it fails cleanly (default `60`). |
 | `GROQ_API_KEY` | Your Groq API key. Required when `LLM_PROVIDER=groq`. Never commit this. |
-| `GROQ_REQUESTS_PER_MINUTE` | Client-side throttle for Groq calls (default `25`). See "Rate limiting" below. |
-| `GROQ_REASONING_EFFORT` | `low`/`medium`/`high` reasoning budget, sent only for GPT-OSS models (`openai/gpt-oss-20b`/`-120b`; ignored for other Groq models). Default `low`. See "GPT-OSS empty responses" below — this is what fixes empty critic/reporter output on those models. |
+| `GROQ_REQUESTS_PER_MINUTE` | Client-side throttle for Groq calls (default `25`). |
+| `GROQ_REASONING_EFFORT` | `low`/`medium`/`high` reasoning budget for GPT-OSS models only (default `low`). |
 | `ANTHROPIC_API_KEY` | Your Anthropic API key. Only required when `LLM_PROVIDER=anthropic`. |
-| `RESEARCHPILOT_MAX_ITERATIONS` | Max research/evaluate loop iterations before forcing a report (default `3`). Prevents infinite loops. |
-| `RESEARCHPILOT_MEMORY_PATH` | Path to the JSON memory store (default `memory/agent_memory.json`). Blank/unset values safely fall back to that default. See "Memory" above. |
-| `RESEARCHPILOT_EVALUATOR_TIMEOUT_SECONDS` | Critic wall-clock ceiling (default `45`). On the first critic timeout, the agent performs one deterministic deeper-source recovery pass using already-collected URLs; a later timeout ends research and reports the uncertainty explicitly. |
-| `RESEARCHPILOT_REPORTER_TIMEOUT_SECONDS` | Final report LLM wall-clock ceiling (default `45`). If synthesis exceeds it, ResearchPilot immediately produces a deterministic evidence-only fallback report instead of hanging. If the critic explicitly did not confirm evidence sufficiency, LLM narrative synthesis is skipped entirely and an evidence-only report is produced. |
-| `RESEARCHPILOT_REPORTER_MAX_TOKENS` | Maximum tokens requested for final narrative synthesis (default `1000`). |
-| `RESEARCHPILOT_EVALUATOR_MAX_TOKENS` | Maximum critic JSON generation budget (default `900`). Kept bounded because the critic returns structured JSON only. |
+| `RESEARCHPILOT_MAX_ITERATIONS` | Max research/critic loop iterations before forcing a report (default `3`). |
+| `RESEARCHPILOT_MEMORY_PATH` | Path to the JSON memory store (default `memory/agent_memory.json`). |
+| `RESEARCHPILOT_EVALUATOR_TIMEOUT_SECONDS` | Critic wall-clock ceiling (default `45`). |
+| `RESEARCHPILOT_EVALUATOR_MAX_TOKENS` | Max critic JSON generation budget (default `900`). |
+| `RESEARCHPILOT_REPORTER_TIMEOUT_SECONDS` | Final report LLM wall-clock ceiling (default `45`). |
+| `RESEARCHPILOT_REPORTER_MAX_TOKENS` | Max tokens requested for final narrative synthesis (default `1000`). |
 
-### Rate limiting (Groq)
+## Running instructions
 
-Provider calls also have a bounded request timeout (`LLM_TIMEOUT_SECONDS`, default 60 seconds), so a stalled API request returns control instead of hanging forever. The in-loop critic uses its own 45-second ceiling and one bounded recovery pass described below.
+```bash
+# Ask a specific question
+python -m app.main "What are the key differences between PostgreSQL and MySQL for a high-write OLTP workload?"
 
-Two Groq rate-limit layers, both in `app/llm_provider.py`:
+# Interactive prompt (no args)
+python -m app.main
 
-1. **Proactive throttle** — `RateLimiter` enforces a minimum gap between
-   calls based on `GROQ_REQUESTS_PER_MINUTE` (default 25/min, kept under
-   typical free-tier ~30 RPM limits), so ordinary use shouldn't trip a 429
-   at all.
-2. **Reactive backoff** — if a `429` (`RateLimitError`) still happens, the
-   client reads the server's `retry-after` header, sleeps exactly that
-   long, and retries once (up to `max_retries`, default 3) before failing
-   with a clear `LLMError`. Non-rate-limit API errors are not retried.
+# Demo mode: runs a built-in comparison question with extra banners,
+# so the full PLAN -> ACT -> OBSERVE -> STATE -> CRITIC -> REPORT trace
+# is easy to follow end to end
+python -m app.main --demo
 
-If you're on a paid/higher-throughput Groq tier, raise
-`GROQ_REQUESTS_PER_MINUTE` in `.env` accordingly.
+# Deterministic evaluation suite over completed-run fixtures
+python -m app.evaluate
 
-### GPT-OSS empty responses (`openai/gpt-oss-20b` / `-120b`)
+# Full test suite
+python -m pytest tests/ -v
+```
 
-These are *reasoning* models: on Groq's chat-completions endpoint, reasoning
-tokens and the final answer share the same `max_tokens` budget. If reasoning
-consumes the whole budget, `message.content` comes back as an **empty
-string with no error at all** — indistinguishable, from the caller's side,
-from the model simply choosing to say nothing. This is what
-`evaluator.py`'s bounded critic retry (`"No JSON object found in evaluator
-output: ''"`) was built to catch, and it correctly falls back to an
-evidence-only report rather than guessing — but it's still worth avoiding,
-since it means no LLM-synthesized answer that pass.
+Terminal output is a live, human-readable trace of every stage (`[PLAN]`,
+`[TOOL]`, `[OBSERVE]`, `[STATE]`, `[CRITIC]`, `[DECISION]`, `[REPORT]`,
+`[MEMORY]`); the finished report is also saved as a timestamped Markdown
+file under `output/`.
 
-`GroqClient` now sends `reasoning_effort=low` (via `GROQ_REASONING_EFFORT`,
-default `low`) for GPT-OSS models specifically — Groq only accepts this
-field for GPT-OSS 20B/120B, so it's omitted for every other model. This
-caps how much of the budget reasoning is allowed to spend, leaving room for
-the actual JSON/text answer. It's most likely to matter on the smaller
-`openai/gpt-oss-20b` and on the critic/reporter's larger prompts (more
-gathered findings = more for the model to reason about before answering).
-If empty responses persist even at `low`, raising
-`RESEARCHPILOT_EVALUATOR_MAX_TOKENS` / `RESEARCHPILOT_REPORTER_MAX_TOKENS`
-gives the model more total room to fit both reasoning and the answer.
+## Example input
+
+```bash
+python -m app.main "What is the capital of France?"
+```
+
+## Example output
+
+Terminal trace (abbreviated):
+
+```
+======================================================================
+USER TASK
+What is the capital of France?
+======================================================================
+[MEMORY] No related past runs found.
+[PLAN] Created 3 research step(s): ["Search for 'capital of France'", ...]
+[TOOL] web_search
+[RESEARCH] Searching: Search for 'capital of France'
+[OBSERVE] 3 result(s) found
+...
+[STATE] findings=3 sources=9 completed_steps=3/3
+[CRITIC] Evaluating evidence (iteration 1/3)...
+[CRITIC] Evidence sufficient — continuing to report.
+[REPORT] Generating final report (max 45s; fallback enabled)...
+[MEMORY] Saved this run's queries/sources for future planning.
+
+======================================================================
+FINAL REPORT
+======================================================================
+# Research Report
+
+## Executive Summary
+The capital of France is Paris.
+...
+## Sources
+- Paris - Wikipedia (https://en.wikipedia.org/wiki/Paris)
+- France | History, Maps, Flag, Population, Cities, Capital, & Facts ... (https://www.britannica.com/place/France)
+...
+
+[TOOL] report_writer
+[SAVED] output/report_20260927_174032.md
+
+======================================================================
+SUMMARY: 3 step(s) planned, 3 completed, 9 source(s) gathered, 1 research iteration(s)
+======================================================================
+```
+
+For a question that genuinely needs more than one pass — e.g.
+`python -m app.main --demo` ("Compare the pricing and context window size of
+the latest Claude and GPT models") — the same run visibly loops: the critic
+flags specific missing numbers, queues new `page_reader` steps against exact
+URLs already found, and only proceeds to the report once it confirms
+sufficiency (or the iteration cap is reached). If the evidence genuinely
+never firms up, the Executive Summary says so explicitly rather than
+guessing — this is the grounding gate working as intended, not a failure.
+
+## Failure handling
+
+| Failure mode | How it's handled |
+|---|---|
+| Empty / malformed / oversized task input | `guardrails.validate_task`, checked before any LLM/tool call |
+| Outbound URL is unsafe (SSRF-shaped) | `guardrails.validate_fetch_url` blocks non-http(s) schemes, missing hosts, and loopback/private/link-local/known-local hostnames before `page_reader` ever makes a request |
+| API failure / provider timeout | `app/llm_provider.py` (`LLMError`, hard timeout, Groq rate-limit retry with `retry-after`) |
+| Search / page-read failure | Per-tool `try/except` in `app/researcher.py`, turned into a findings note instead of a crash |
+| Malformed LLM JSON (plan or critique) | Bounded extraction + one retry (`_extract_json_array` / `_extract_json_object`) |
+| Invalid calculator input | `ast`-based evaluator, raises `CalculatorError` — never `eval` |
+| Maximum iterations reached | Enforced in `app/evaluator.py` before any further LLM call — the loop cannot run forever |
+| Critic times out or fails | First timeout triggers one bounded deeper-source recovery pass; if still unconfirmed, research stops and evidence sufficiency is explicitly recorded as unconfirmed — never silently marked sufficient |
+| Missing sources / unsupported claims | Reporter's grounding gate skips LLM narrative synthesis when the critic didn't confirm sufficiency, and emits a deterministic evidence-only report instead |
+| Empty/failed report synthesis | Deterministic fallback narrative preserves gathered evidence rather than inventing conclusions |
+| Corrupt/missing memory file | Treated as an empty store (logged, not raised) — never blocks a run |
+| Empty final report (defensive net) | `app/main.py` refuses to save/print a blank report; should be unreachable given the fallbacks above, but guarded anyway |
+
+## Limitations
+
+- `validate_fetch_url` blocks known-local hostnames and literal private/
+  loopback/link-local IPs, but does not resolve hostnames via DNS — so it
+  does not defend against DNS rebinding.
+- Task input validation is deterministic length/shape checks, not an
+  LLM-based "is this a sensible research question" classifier.
+- The critic's quality `issues` (unsupported claims, off-topic sources) are
+  surfaced in the report's Limitations, but don't independently trigger a
+  new research pass beyond what the coverage check already drives.
+- Web search uses a no-key DuckDuckGo HTML scrape — fine for this stage,
+  more fragile than a paid search API.
+- `page_reader` does simple `<p>` extraction for HTML (no JS rendering) and
+  page-by-page text extraction for PDFs via `pypdf` (no OCR) — it won't get
+  useful text from a heavily JS-rendered page or a scanned/image-only PDF.
+- Memory retrieval is plain keyword overlap on goal text, not semantic
+  similarity — no embeddings/vector store.
+- Memory only records `web_search` queries as successful/failed;
+  `page_reader`/`calculator` calls aren't stored as search patterns.
+- No user-feedback storage on finished reports.
+- The memory store is a single flat JSON file with no size cap or pruning —
+  fine at prototype/contest scale, will grow unbounded over many real runs.
+- `app/evaluate`'s benchmark uses fixed completed-run fixtures, not live
+  research — useful for regression/transparency, not a measure of current
+  web-search quality.
+- Relevance and grounding are lexical heuristics, not semantic/factual
+  verification; the four-case fixture dataset is small and representative,
+  not a statistically meaningful benchmark.
+- CLI only — no web UI, no persistent database beyond the JSON memory file,
+  no multi-agent parallelism, single LLM provider per run (no automatic
+  cross-provider fallback).
+
+## Future improvements
+
+- Optional semantic memory retrieval (embeddings) as an alternative to
+  keyword overlap, for goals phrased very differently from past ones.
+- A live-web evaluation harness (real search + real critic) as a
+  supplementary signal alongside the current deterministic fixture suite.
+- Additional tools: a structured API connector (rather than only web
+  search/page reading), and OCR for scanned/image-only PDFs.
+- A lightweight web UI or dashboard over the same graph, so a run can be
+  watched/replayed without a terminal.
+- Parallel execution of independent research steps within one pass,
+  instead of processing the plan sequentially.
+- Automatic fallback across LLM providers if the configured one is down,
+  rather than a single configured provider per run.
+- Bounded pruning/rotation for the memory store once it grows large.
+- A critic that can re-route research specifically to resolve a flagged
+  quality issue (e.g. re-verify an unsupported claim), not only a coverage
+  gap.
 
 ## Testing
 
@@ -428,296 +516,22 @@ pip install pytest
 python -m pytest tests/ -v
 ```
 
-`tests/test_mvp.py` (Phase 1), `tests/test_phase2.py` (Phase 2),
-`tests/test_phase3.py` (Phase 3), `tests/test_phase4.py` (Phase 4),
-`tests/test_phase5.py` (Phase 5), `tests/test_phase6.py` (Phase 6),
-`tests/test_phase7.py` (Phase 7), and `tests/test_phase8.py` (Phase 8)
-cover `AgentState`, all four tools (`calculator`, `page_reader`,
-`report_writer`, and `web_search` indirectly via the researcher),
-JSON-extraction (planner + evaluator), the evaluator/critic's routing
-decision, iteration cap, and quality-`issues` surfacing,
-`tool_selector.choose_tool` for every step shape, the researcher's dedup
-and tool-routing logic, `generate_report`'s section parsing/assembly
-(order, deterministic Methodology/Sources/Research Question content, the
-no-findings and malformed-LLM-output fallbacks), and `app/memory.py`'s
-store load/save/corrupt-file handling, `record_run`'s
-successful/failed-query split and domain de-duplication,
-`retrieve_relevant_experience`'s keyword-overlap matching, and the
-planner's inclusion (or graceful omission) of a memory hint in its
-prompt, plus Phase 7 evaluation-result creation, required-section checks,
-source coverage, grounding warnings, incomplete research, and iteration-limit
-behavior, plus Phase 8's `validate_task` (empty/whitespace/too-long/
-no-word-character rejection), `validate_fetch_url` (blocked schemes,
-loopback/private/link-local/known-local-hostname rejection), and
-`read_page` refusing a blocked URL without ever reaching `requests.get`
-— all without needing network access or an API key
-(`requests.get` / `web_search` / `read_page` / the LLM client are
-monkeypatched out wherever a test would otherwise need the network;
-`write_report` and the memory store's file I/O are exercised for real
-against a `tmp_path`, since both are pure filesystem ops safe to run
-anywhere). They do **not** cover live LLM calls or live web search
-themselves, since those need real credentials and open internet access;
-verify those manually with `python -m app.main "..."` (see "How this was
-tested" below).
+**122 tests**, covering every phase of development: `AgentState`, all four
+tools (`calculator`, `page_reader`, `report_writer`, and `web_search`
+indirectly via the researcher), JSON-extraction and routing decisions in
+the planner/evaluator, `tool_selector.choose_tool` for every step shape,
+`generate_report`'s section parsing/assembly and fallback paths,
+`app/memory.py`'s load/save/corrupt-file handling and keyword-overlap
+retrieval, the Phase 7 evaluation module's metric checks, Phase 8's input
+and outbound-URL guardrails, Phase 10's `--demo` flag and `[STATE]`
+logging — and two full **end-to-end tests** (`tests/test_end_to_end.py`)
+that build and invoke the actual compiled LangGraph graph (not a mocked
+node in isolation), driving a genuine two-pass research loop and verifying
+the iteration cap actually bounds it.
 
-## How this was tested
-
-### Phase 8
-
-Executed in the same environment as Phase 7, with only `app/guardrails.py`,
-`app/tools/page_reader.py`, and `app/main.py` changed:
-- `pytest tests/ -v`: **113/113 passed** (all Phase 1-7 regression tests
-  unchanged, plus 16 new Phase 8 tests covering task validation, URL/SSRF
-  validation, and `page_reader` refusing a blocked URL before any HTTP call
-  is attempted).
-- Manual CLI check of the three input-guardrail paths (`python -m app.main`
-  with an empty string, a 3000-character string, and `"??? !!!"`) — each
-  exits with status `1` and a clear one-line error, before any LLM call or
-  network access is attempted.
-- No live web or LLM call was needed for any Phase 8 change or test.
-
-### Phase 7
-
-Executed in the Phase 7 build environment with the real installed project
-dependencies:
-- `pytest tests/ -v`: **97/97 passed** after the final Phase 7 stabilization patch. This includes all Phase 1-7 regression tests plus coverage for provider hard timeouts, blank memory-path handling, bounded critic prompts, one-shot timeout recovery, second-timeout termination, empty/malformed reporter output, reporter hard timeouts, and the grounding gate that blocks narrative synthesis when critic sufficiency is unconfirmed.
-- `python -m app.evaluate`: **4 fixture cases executed** and a timestamped
-  JSON result was written to `output/evaluations/`. Aggregate scores were
-  relevance `1.0000`, completeness `0.9583`, source coverage `1.0000`,
-  grounding `0.9167`, format quality `1.0000`, overall `0.9750`.
-- No live web or LLM call is part of the default Phase 7 suite, deliberately,
-  so rerunning it is reproducible and does not depend on changing search
-  results, provider nondeterminism, credentials, or rate limits. Live agent
-  calls are separately protected by `LLM_TIMEOUT_SECONDS` (default 60s).
-
-### Phase 6
-
-Confirmed on the user's own machine (Windows, Python 3.14.7,
-`pytest-9.1.1`, real `pydantic`/`langgraph`/`anthropic`/`groq`
-installed), superseding the offline-shimmed checks described below:
-- `python -m pytest tests/ -v`: **79/79 passed**, including all 20
-  `tests/test_phase6.py` tests, with zero regressions in
-  `test_mvp.py`/`test_phase2-5.py`.
-- A live `python -m app.main "What is the current pricing for
-  Anthropic's Claude API, including the newest models?"` run confirmed
-  the whole Phase 6 wiring end-to-end against real network + LLM calls:
-  - `[MEMORY] No related past runs found.` on this first-ever run (empty
-    store), and `[MEMORY] Saved this run's queries/sources for future
-    planning.` after the report — `memory/agent_memory.json` now holds
-    one record. A second, related run of the same question then logged
-    `[MEMORY] Found 1 related past run(s) — adding hints to the plan
-    prompt.`, confirming `retrieve_relevant_experience`'s keyword-overlap
-    match actually fires against a real on-disk store, not just the
-    offline harness below — closing the one gap noted after the first
-    live run.
-  - The `reporter -> memory_writer -> END` edge ran cleanly as part of a
-    real `build_graph()` invocation — not just something exercised via a
-    dataclass stand-in.
-  - The critic/evaluator loop ran for the full 4 iterations (3 more
-    passes + the max-iteration cutoff), each time correctly flagging
-    quality issues — reliance on third-party price-aggregator sources
-    (`llmpricecheck.com`, `pricepertoken.com`, `coursiv.io`,
-    `claudelab.net`), and unverified/undated figures — without those
-    issues alone forcing endless re-search once coverage looked
-    sufficient. This is exactly the documented Phase 5 limitation in
-    practice: *"the critic doesn't yet re-route research specifically to
-    resolve a quality issue that isn't also a coverage gap"* — worth
-    keeping in mind when reading a report's numbers, since a flagged
-    quality issue doesn't block the report from citing that source.
-
-What was *not* re-verified by these real runs (still only checked via
-the offline harness below, or not applicable to these queries): the
-missing-file/corrupt-JSON fallback paths in `load_memory` (no corrupt
-file occurred during a normal run).
-
-<details>
-<summary>Original offline validation (before the real run above)</summary>
-
-This environment (used to build Phase 6) had no network access
-(`pip install -r requirements.txt` could not run — no `pydantic`,
-`langgraph`, etc.) and no LLM/API credentials. What was actually
-*executed* there:
-- `python -m py_compile` on every touched file (`app/memory.py`,
-  `app/planner.py`, `app/graph.py`, and the new `tests/test_phase6.py`):
-  clean.
-- `app/memory.py`'s real code — `load_memory`/`save_memory` (including
-  the missing-file and corrupt-JSON fallback paths), `record_run` (the
-  successful/failed `web_search`-query split, domain de-duplication from
-  `state.sources`, the `sufficient` default when `state.critique` is
-  `None`), `retrieve_relevant_experience` (keyword-overlap scoring and
-  the `max_runs` cap), `format_memory_hint`, and `get_planning_hint` —
-  was run directly against real temp-file paths via a standalone
-  harness, using a small dataclass-based stand-in for `app.state`'s
-  `AgentState`/`Source`/`ToolCallRecord` (since real `pydantic` wasn't
-  installable offline there, the same constraint Phase 5 hit). Every
-  assertion from `tests/test_phase6.py`'s equivalent scenarios was
-  checked this way and passed, including the "persists across separate
-  record/retrieve calls" case.
-- `app/planner.py`'s actual `plan()` function was exercised the same way
-  (real `app.planner` module, `app.state`/`app.llm_provider` stubbed),
-  confirming the memory hint text is folded into the LLM prompt when a
-  related past run exists, and that the prompt is byte-identical to the
-  pre-Phase-6 form (`"Research goal: {goal}"`, no trailing hint section)
-  when nothing relevant is found.
-
-</details>
-
-### Phase 5
-
-The environment used to build Phase 5 has no network access (so
-`pip install -r requirements.txt` — `langgraph`, `pydantic`, etc. — could
-not run) and no LLM/API credentials. Given that, what was actually
-*executed* here:
-- `app/reporter.py`'s pure logic (`_split_sections`, `_build_methodology`,
-  `_build_limitations`, `_build_sources`) was run directly with a small
-  standalone harness (no `app.state`/pydantic dependency), covering
-  heading parsing, tool-count formatting, and URL de-duplication.
-- `tests/test_phase5.py` (7 new tests: section parsing with/without valid
-  headings, full `generate_report` assembly against a `FakeLLM` including
-  section order and deterministic-content checks, the no-findings case,
-  the malformed-LLM-output fallback, and both `write_report` behaviors —
-  passthrough for an already-formatted report and the old wrap-a-bare-body
-  path for backward compatibility) was executed against the real
-  `app/reporter.py` and `app/tools/report_writer.py` using minimal
-  same-shape shims for `pydantic.BaseModel`/`Field` and `dotenv` (since
-  those packages themselves aren't installable offline here) — **all 7
-  passed**. `tests/test_phase3.py`'s two existing `write_report` tests
-  were re-run the same way to confirm no regression — **both passed**.
-- A full sample report was rendered end-to-end (`generate_report` with a
-  scripted `FakeLLM`, real `Source`/`ToolCallRecord` objects) to eyeball
-  the actual output — section order, methodology numbers, and source
-  de-duplication all matched expectations.
-- **Not** run here: `python -m pytest tests/ -v` against the *real*
-  `pydantic`/`langgraph` install, `python -m py_compile`, and any live
-  `python -m app.main "..."` run. **Run these yourself** — with
-  `requirements.txt` installed and `.env` filled in — before treating
-  Phase 5 as fully validated; the shimmed tests prove `app/reporter.py`'s
-  logic is correct, not that it imports cleanly against the real
-  dependency versions pinned in `requirements.txt`.
-
-### Phase 3 (unchanged since)
-
-In the environment used to build this phase, `pip install -r
-requirements.txt pytest` succeeded and every check below was actually
-*executed* (not just reviewed):
-- `python -m py_compile` on every `app/**/*.py` file: clean.
-- `python -m pytest tests/ -v`: **44/44 passed**, including all 21 new
-  Phase 3 tests (`tool_selector`; `page_reader` against canned HTML and
-  against both real and mocked PDF content; `report_writer` against a
-  real temp directory; the researcher's routing to each of the three
-  tools; and the evaluator's known-sources grounding for proposed URLs).
-- A follow-up fix, made after two real runs surfaced issues live: (1) the
-  evaluator was proposing plausible-but-fabricated URLs instead of
-  copying real ones from `state.sources` — fixed by giving it an exact
-  "Known sources" list to copy from, plus a code-level filter that drops
-  any proposed URL not in that list; (2) `page_reader` returned "no
-  readable text" for an official pricing PDF, because PDF bytes were
-  being parsed as HTML — fixed by adding Content-Type/`.pdf`-suffix
-  detection and a `pypdf`-based extraction path. Both are covered by new
-  tests, and the PDF path was additionally verified against a real,
-  freshly-built PDF byte stream (not just a mocked `PdfReader`) to
-  confirm the actual parsing logic works, not only the mock.
-- A full offline **integration smoke test**: `app.graph.build_graph()`
-  invoked end-to-end with the LLM calls and `web_search`/`read_page`
-  monkeypatched to return scripted responses (a first pass that's
-  incomplete, a plan step that's a calculation, an evaluator-proposed URL
-  for the second pass). This confirmed the whole
-  planner -> researcher (routing to web_search, then calculator, then
-  page_reader) -> evaluator -> researcher -> evaluator -> reporter ->
-  write_report path actually wires together and produces a saved report —
-  not just that each piece compiles in isolation.
-- Live web search and live LLM calls: this sandbox's network egress is
-  restricted to a package-registry allowlist (pypi, npm, GitHub, etc.),
-  so DuckDuckGo and arbitrary URLs are not reachable from here, and no
-  API key is configured. These paths are exercised by the mocked
-  integration test above instead.
-
-**You should still run a real `python -m app.main "..."` query on your
-own machine** (with `.env` filled in and open internet access) before
-treating Phase 3 (or Phase 5's report formatting on real output) as fully
-validated end-to-end — the mocked test proves
-the wiring is correct, not that DuckDuckGo's current HTML markup or a
-particular live page still parses as expected. A good test query is one
-that plausibly needs a calculation and a deeper look at one source, e.g.
-"What would a year of the Notion paid plan cost, and how does that
-compare to the free plan's limits?", so you can watch [TOOL] web_search,
-[TOOL] calculator, and potentially [TOOL] page_reader all fire in one
-run.
-
-## Known limitations (Phase 8 stage, expected)
-
-- `validate_fetch_url` blocks known-local hostnames and literal
-  loopback/private/link-local/reserved IPs, but does **not** resolve
-  hostnames via DNS — so it does not defend against DNS rebinding (a
-  hostname that resolves to a public IP at validation time but a private
-  one at request time). This was a deliberate tradeoff to keep the check
-  pure/offline, consistent with this project's tool-testing convention.
-- Task input validation (`validate_task`) is a small set of deterministic
-  length/shape checks, not an LLM-based "is this actually a sensible
-  research question" classifier — per Phase 8's own "do not over-engineer
-  safety features unrelated to the contest" instruction.
-- Guardrails only cover the two gaps that weren't already handled
-  elsewhere (see the "Guardrails" table above); they don't change any of
-  the existing timeout/retry/fallback behavior from Phases 2-7.
-
-- The critic's quality `issues` (unsupported claims, off-topic sources)
-  are surfaced in the report's Limitations section, but don't otherwise
-  change agent behavior beyond what Phase 2's coverage check already
-  drove — the critic doesn't yet re-route research specifically to
-  resolve a quality issue that isn't also a coverage gap.
-- When the critic confirms sufficiency, `Key Findings` vs `Comparison / Analysis` still depend on the reporter LLM following the requested section semantics. When the critic explicitly does **not** confirm sufficiency, narrative synthesis is skipped and the deterministic evidence-only fallback is used instead.
-- If the evaluator's LLM call fails, the code does **not** mark evidence sufficient. A first timeout can trigger one bounded deeper-source recovery pass. If sufficiency still cannot be confirmed, the reporter skips LLM narrative synthesis and emits an evidence-only report so unsupported claims are not promoted into confident conclusions.
-- Web search still uses a no-key DuckDuckGo HTML scrape — fine for this
-  stage, but more fragile than a paid search API.
-- Tool selection (`app/tool_selector.py`) is deterministic pattern
-  matching, not an LLM call — see "Tool selection" above for why that's
-  the simplest robust option here, not a corner cut.
-- `page_reader` does a single unstructured `<p>` extraction for HTML (no
-  JS rendering) and a page-by-page text extraction for PDF via `pypdf` —
-  fine for typical article/pricing pages and text-based PDFs, but it
-  won't get useful text from a heavily JavaScript-rendered page or a
-  scanned/image-only PDF with no text layer (no OCR).
-- Memory retrieval is plain keyword overlap on goal text, not semantic
-  similarity — a related goal phrased with entirely different words
-  (e.g. "Notion cost" vs. "How much do I pay for a workspace tool") won't
-  match. No embeddings/vector store, per Phase 6's "do not build a
-  complex vector database unless actually necessary."
-- Memory only records `web_search` queries as successful/failed;
-  `page_reader`/`calculator` calls aren't queries and aren't stored as
-  search patterns, so a run driven mostly by page-reading leaves fewer
-  hints for next time.
-- No user-feedback storage — the CLI doesn't currently collect feedback
-  on a finished report, so that part of the Phase 6 schema is left out
-  rather than faked (see "Memory" above).
-- The memory store is a single flat JSON file with no size cap or
-  pruning — fine at prototype/contest scale, but it will grow unbounded
-  over many real runs.
-- Phase 7's default benchmark uses fixed completed-run fixtures rather than
-  executing live research. It is useful for regression and transparency, but
-  it does not measure current web-search quality or provider behavior.
-- Relevance and grounding are lexical heuristics. Synonyms/paraphrases can be
-  under-scored, while lexical overlap can over-score a claim that is phrased
-  similarly but is still wrong; the evaluator therefore flags likely issues
-  rather than claiming semantic truth.
-- The four-case dataset is intentionally small and representative, not a
-  statistically meaningful benchmark. Scores should not be used to claim the
-  agent improved without a larger controlled comparison across versions.
-
-### Live-run timeout behavior
-
-Provider SDK calls are protected by `LLM_TIMEOUT_SECONDS` (default 60 seconds),
-and the critic has a stricter `RESEARCHPILOT_EVALUATOR_TIMEOUT_SECONDS`
-(default 45 seconds). If the first critic request exceeds that wall-clock
-limit, ResearchPilot does **not** mark the evidence sufficient. Instead it
-deterministically selects up to three already-collected, unread source URLs
-and performs one deeper `page_reader` recovery pass before running the critic
-again. If the critic is still unavailable after that bounded recovery, the
-loop stops and the report explicitly records that evidence sufficiency could
-not be confirmed. In that state the reporter **does not call the narrative
-LLM at all**; it emits a deterministic evidence-only report from the findings
-and sources already stored in state. This prevents an unverified synthesis
-from inventing prices, dates, model names, or other conclusions. Timeout
-failures are not retried immediately, while fast malformed/empty critic
-responses may still retry once. Critic and report prompts also retain only a
-bounded amount of the newest gathered evidence so later research passes do
-not grow the LLM input without limit.
+All of this runs without network access or a real API key — every
+network/LLM call is monkeypatched out; only pure filesystem operations
+(`write_report`, the memory store) touch a real (temporary) disk. Live LLM
+calls and live web search are *not* covered by the automated suite, since
+they need real credentials and internet access — verify those manually
+with `python -m app.main "..."` or `python -m app.main --demo`.
