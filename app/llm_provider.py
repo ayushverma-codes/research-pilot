@@ -152,7 +152,18 @@ class GroqClient:
         failing immediately or hammering the API.
     """
 
-    def __init__(self, model: str, requests_per_minute: float = 25, max_retries: int = 3):
+    # Models that support (and, on Groq, default to spending real budget on)
+    # a separate reasoning pass before the final answer - see `complete`'s
+    # reasoning_effort handling below.
+    _REASONING_MODEL_PREFIXES = ("openai/gpt-oss-",)
+
+    def __init__(
+        self,
+        model: str,
+        requests_per_minute: float = 25,
+        max_retries: int = 3,
+        reasoning_effort: str | None = None,
+    ):
         try:
             import groq
         except ImportError as e:
@@ -178,12 +189,29 @@ class GroqClient:
         self.model = model
         self.max_retries = max_retries
         self._limiter = RateLimiter(requests_per_minute)
+        # Only meaningful (and only accepted by Groq) for GPT-OSS models -
+        # see the module-level GROQ_REASONING_EFFORT env var and `complete`.
+        self.reasoning_effort = reasoning_effort
 
     def complete(self, prompt: str, system: str = "", max_tokens: int = 1500) -> str:
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
+
+        # GPT-OSS models ("reasoning" models) spend part of `max_tokens` on
+        # an internal reasoning pass before the final answer, on the same
+        # token budget - a request that reasons right up to the limit comes
+        # back with an EMPTY `message.content` and no error at all (this is
+        # exactly what evaluator.py's "No JSON object found... ''" retries
+        # were catching live). `reasoning_effort="low"` caps how much of the
+        # budget reasoning is allowed to spend, leaving room for the actual
+        # JSON/text answer. It's only accepted by GPT-OSS models, so it's
+        # only sent for those; other Groq models ignore/reject the field.
+        is_reasoning_model = self.model.startswith(self._REASONING_MODEL_PREFIXES)
+        extra_kwargs = {}
+        if is_reasoning_model and self.reasoning_effort:
+            extra_kwargs["reasoning_effort"] = self.reasoning_effort
 
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
@@ -195,6 +223,7 @@ class GroqClient:
                         model=self.model,
                         max_tokens=max_tokens,
                         messages=messages,
+                        **extra_kwargs,
                     ),
                     timeout,
                 )
@@ -240,6 +269,12 @@ def get_llm_client():
     if provider == "groq":
         model = os.getenv("LLM_MODEL", "openai/gpt-oss-120b")
         rpm = float(os.getenv("GROQ_REQUESTS_PER_MINUTE", "25"))
-        return GroqClient(model=model, requests_per_minute=rpm)
+        # "low" by default: GPT-OSS models otherwise default to spending a
+        # sizeable, variable share of max_tokens on internal reasoning before
+        # any visible answer, which is what caused live empty-JSON critic
+        # responses on the larger evaluator/reporter prompts - see
+        # GroqClient.complete's docstring/comment for the full mechanism.
+        reasoning_effort = os.getenv("GROQ_REASONING_EFFORT", "low").strip() or "low"
+        return GroqClient(model=model, requests_per_minute=rpm, reasoning_effort=reasoning_effort)
 
     raise LLMError(f"Unsupported LLM_PROVIDER: '{provider}'. Supported: anthropic, groq")

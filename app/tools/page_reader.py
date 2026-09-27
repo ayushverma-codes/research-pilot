@@ -26,6 +26,8 @@ from bs4 import BeautifulSoup
 from pypdf import PdfReader
 from pypdf.errors import PdfReadError
 
+from app.guardrails import GuardrailError, validate_fetch_url
+
 HEADERS = {"User-Agent": "Mozilla/5.0 (ResearchPilot Agent)"}
 
 # Strip these before extracting text - they're never article content.
@@ -86,10 +88,17 @@ def read_page(url: str, timeout: int = 10, max_chars: int = 4000) -> PageContent
     """
     Fetch `url` and return its title + main text (truncated to `max_chars`).
     Transparently handles both HTML pages and PDF documents. Raises
-    RuntimeError on any network failure, bad status, unparsable PDF, or a
-    page with no extractable text, so callers can handle it the same way
-    they handle a failed web_search.
+    RuntimeError on any network failure, bad status, unparsable PDF, a
+    page with no extractable text, or a URL that fails guardrail
+    validation (non-http(s) scheme, or a loopback/private/link-local
+    target - see app/guardrails.py), so callers can handle it the same
+    way they handle a failed web_search.
     """
+    try:
+        url = validate_fetch_url(url)
+    except GuardrailError as e:
+        raise RuntimeError(f"read_page refused '{url}': {e}") from e
+
     try:
         resp = requests.get(url, headers=HEADERS, timeout=timeout)
         resp.raise_for_status()

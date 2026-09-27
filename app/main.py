@@ -13,6 +13,7 @@ import sys
 from app.graph import build_graph
 from app.state import AgentState
 from app.tools.report_writer import write_report
+from app.guardrails import GuardrailError, validate_task
 
 
 def run(user_goal: str) -> AgentState:
@@ -28,8 +29,10 @@ def main() -> None:
     else:
         user_goal = input("Enter your research question: ").strip()
 
-    if not user_goal:
-        print("Error: research question cannot be empty.")
+    try:
+        user_goal = validate_task(user_goal)
+    except GuardrailError as e:
+        print(f"Error: {e}")
         sys.exit(1)
 
     print(f"[GOAL] {user_goal}")
@@ -38,6 +41,14 @@ def main() -> None:
         state = run(user_goal)
     except Exception as e:  # noqa: BLE001 - top-level CLI error boundary
         print(f"[ERROR] Agent run failed: {e}")
+        sys.exit(1)
+
+    if not state.final_report or not state.final_report.strip():
+        # Defensive net only: every current code path through reporter.py
+        # always emits a fully-headed report (with "(no findings
+        # gathered)"-style placeholders), so this should be unreachable.
+        # Guard it anyway rather than saving/printing a blank file.
+        print("[ERROR] Agent run produced an empty report; nothing to save.")
         sys.exit(1)
 
     print(f"\n[SUMMARY] {len(state.plan)} total step(s) planned, "

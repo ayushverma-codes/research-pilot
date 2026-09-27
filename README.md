@@ -1,4 +1,4 @@
-# ResearchPilot (Phase 6 — persistent memory)
+# ResearchPilot (Phase 8 — guardrails + failure handling)
 
 An autonomous web research and report-generation agent. Phase 1 was a
 linear **PLAN → ACT → OBSERVE → UPDATE STATE → FINAL** pipeline. Phase 2
@@ -18,8 +18,16 @@ Limitations, Sources) — see "Report format" below. Phase 6 adds
 **lightweight persistent memory**: every run's queries, successes,
 failures and useful source domains are saved to a small JSON file, and
 the planner retrieves related past runs before building a new plan — see
-"Memory" below. A separate evaluation module is **not** implemented yet
-— it comes in Phase 7.
+"Memory" below. Phase 7 added a separate deterministic evaluation module
+for completed runs (`app/evaluation.py`, `python -m app.evaluate`) — see
+"Evaluation" below. Phase 8 adds explicit **guardrails**: input
+validation on the raw task before any LLM/tool call is made, and outbound
+URL validation on `page_reader` (blocked schemes, loopback/private/
+link-local targets) — see "Guardrails" below. Everything else Phase 8
+calls for (API/search failure, timeouts, malformed LLM JSON, max
+iterations, missing sources, unsupported claims, empty report) was
+already handled at the point it happens in earlier phases; Phase 8 did
+not duplicate that, only closed the two gaps that remained.
 
 ## What it does right now
 
@@ -246,6 +254,50 @@ Per-case overall scores from the same run: `simple_factual=1.0000`,
 live-web benchmark, not a claim that the agent improved, and not a guarantee
 that future/live research will achieve the same values.
 
+## Guardrails (Phase 8)
+
+Phase 8 is deliberately scoped to the gaps that weren't already covered.
+Most of "guardrails + failure handling" was already load-bearing
+functionality from earlier phases:
+
+| Failure mode | Where it's actually handled |
+|---|---|
+| API failure / provider timeout | `app/llm_provider.py` (`LLMError`, `_run_with_hard_timeout`, Groq rate-limit retry) |
+| Search / page-read failure | `app/researcher.py`'s per-tool `try/except`, turned into a findings note instead of a crash |
+| Malformed LLM JSON (plan or critique) | `app/planner.py` / `app/evaluator.py` (`_extract_json_array` / `_extract_json_object`, with the critic's one bounded retry) |
+| Invalid calculator input | `app/tools/calculator.py` (`ast`-based evaluator, raises `CalculatorError` — never `eval`) |
+| Maximum iterations | `app/evaluator.py` (`RESEARCHPILOT_MAX_ITERATIONS`, enforced before any further LLM call) |
+| Missing sources / unsupported claims | `app/reporter.py`'s grounding gate (skips narrative synthesis when the critic didn't confirm sufficiency) and deterministic Limitations bullets |
+| Empty/failed report synthesis | `app/reporter.py`'s deterministic fallback narrative (evidence preserved, no invented conclusions) |
+
+What Phase 8 actually added, in `app/guardrails.py`:
+
+- **Input validation** (`validate_task`, used by `app/main.py` before the
+  graph is ever invoked): rejects an empty/whitespace-only task, a task
+  over 2000 characters (malformed/abusive input that would just blow up
+  every downstream prompt budget for no benefit), and a task with no
+  actual word characters at all (e.g. `"??? !!!"`) — not a real research
+  question in any recognizable sense.
+- **Outbound URL validation** (`validate_fetch_url`, wired into
+  `app/tools/page_reader.py::read_page`): `page_reader` is the one tool
+  argument in the system that is LLM/search-result influenced *and*
+  reaches outside the process (the calculator only evaluates arithmetic;
+  web_search only takes a query string), so it's the one real SSRF
+  surface. Blocked: any scheme other than `http`/`https` (e.g.
+  `file:///etc/passwd`), a URL with no host, and a host that is a literal
+  loopback/private/link-local/reserved/multicast IP or a known-local
+  hostname (`localhost`, cloud-metadata hostnames, etc.). Deliberately
+  does **not** perform DNS resolution — that would make the check a real
+  network call before `requests.get` even runs, and would break this
+  project's "tools are tested against canned responses, no real network
+  access" convention. It catches the common, cheap SSRF cases rather than
+  claiming to be a complete defense against DNS rebinding.
+- A defensive empty-report check in `app/main.py`, right before saving:
+  every current path through `app/reporter.py` already emits a
+  fully-headed report (with `"(no findings gathered)"`-style
+  placeholders when evidence is thin), so this should be unreachable —
+  it exists so a truly blank report is never silently written to disk.
+
 ## Project structure
 
 ```
@@ -267,6 +319,8 @@ researchpilot/
 │   │                     #   format" above), not just a plain answer
 │   ├── memory.py         # NEW (Phase 6): JSON-backed run history +
 │   │                     #   keyword-overlap retrieval (see "Memory" above)
+│   ├── guardrails.py     # NEW (Phase 8): input task validation +
+│   │                     #   page_reader URL/SSRF validation (see "Guardrails" above)
 │   └── tools/
 │       ├── web_search.py
 │       ├── page_reader.py    # fetch + extract text from one URL
@@ -317,6 +371,7 @@ file under `output/`.
 | `LLM_TIMEOUT_SECONDS` | Maximum duration for one provider request before it fails cleanly (default `60`). Prevents a stalled LLM request from hanging the agent indefinitely. |
 | `GROQ_API_KEY` | Your Groq API key. Required when `LLM_PROVIDER=groq`. Never commit this. |
 | `GROQ_REQUESTS_PER_MINUTE` | Client-side throttle for Groq calls (default `25`). See "Rate limiting" below. |
+| `GROQ_REASONING_EFFORT` | `low`/`medium`/`high` reasoning budget, sent only for GPT-OSS models (`openai/gpt-oss-20b`/`-120b`; ignored for other Groq models). Default `low`. See "GPT-OSS empty responses" below — this is what fixes empty critic/reporter output on those models. |
 | `ANTHROPIC_API_KEY` | Your Anthropic API key. Only required when `LLM_PROVIDER=anthropic`. |
 | `RESEARCHPILOT_MAX_ITERATIONS` | Max research/evaluate loop iterations before forcing a report (default `3`). Prevents infinite loops. |
 | `RESEARCHPILOT_MEMORY_PATH` | Path to the JSON memory store (default `memory/agent_memory.json`). Blank/unset values safely fall back to that default. See "Memory" above. |
@@ -343,6 +398,29 @@ Two Groq rate-limit layers, both in `app/llm_provider.py`:
 If you're on a paid/higher-throughput Groq tier, raise
 `GROQ_REQUESTS_PER_MINUTE` in `.env` accordingly.
 
+### GPT-OSS empty responses (`openai/gpt-oss-20b` / `-120b`)
+
+These are *reasoning* models: on Groq's chat-completions endpoint, reasoning
+tokens and the final answer share the same `max_tokens` budget. If reasoning
+consumes the whole budget, `message.content` comes back as an **empty
+string with no error at all** — indistinguishable, from the caller's side,
+from the model simply choosing to say nothing. This is what
+`evaluator.py`'s bounded critic retry (`"No JSON object found in evaluator
+output: ''"`) was built to catch, and it correctly falls back to an
+evidence-only report rather than guessing — but it's still worth avoiding,
+since it means no LLM-synthesized answer that pass.
+
+`GroqClient` now sends `reasoning_effort=low` (via `GROQ_REASONING_EFFORT`,
+default `low`) for GPT-OSS models specifically — Groq only accepts this
+field for GPT-OSS 20B/120B, so it's omitted for every other model. This
+caps how much of the budget reasoning is allowed to spend, leaving room for
+the actual JSON/text answer. It's most likely to matter on the smaller
+`openai/gpt-oss-20b` and on the critic/reporter's larger prompts (more
+gathered findings = more for the model to reason about before answering).
+If empty responses persist even at `low`, raising
+`RESEARCHPILOT_EVALUATOR_MAX_TOKENS` / `RESEARCHPILOT_REPORTER_MAX_TOKENS`
+gives the model more total room to fit both reasoning and the answer.
+
 ## Testing
 
 ```bash
@@ -352,8 +430,9 @@ python -m pytest tests/ -v
 
 `tests/test_mvp.py` (Phase 1), `tests/test_phase2.py` (Phase 2),
 `tests/test_phase3.py` (Phase 3), `tests/test_phase4.py` (Phase 4),
-`tests/test_phase5.py` (Phase 5), `tests/test_phase6.py` (Phase 6), and
-`tests/test_phase7.py` (Phase 7) cover `AgentState`, all four tools (`calculator`, `page_reader`,
+`tests/test_phase5.py` (Phase 5), `tests/test_phase6.py` (Phase 6),
+`tests/test_phase7.py` (Phase 7), and `tests/test_phase8.py` (Phase 8)
+cover `AgentState`, all four tools (`calculator`, `page_reader`,
 `report_writer`, and `web_search` indirectly via the researcher),
 JSON-extraction (planner + evaluator), the evaluator/critic's routing
 decision, iteration cap, and quality-`issues` surfacing,
@@ -367,7 +446,11 @@ successful/failed-query split and domain de-duplication,
 planner's inclusion (or graceful omission) of a memory hint in its
 prompt, plus Phase 7 evaluation-result creation, required-section checks,
 source coverage, grounding warnings, incomplete research, and iteration-limit
-behavior — all without needing network access or an API key
+behavior, plus Phase 8's `validate_task` (empty/whitespace/too-long/
+no-word-character rejection), `validate_fetch_url` (blocked schemes,
+loopback/private/link-local/known-local-hostname rejection), and
+`read_page` refusing a blocked URL without ever reaching `requests.get`
+— all without needing network access or an API key
 (`requests.get` / `web_search` / `read_page` / the LLM client are
 monkeypatched out wherever a test would otherwise need the network;
 `write_report` and the memory store's file I/O are exercised for real
@@ -378,6 +461,20 @@ verify those manually with `python -m app.main "..."` (see "How this was
 tested" below).
 
 ## How this was tested
+
+### Phase 8
+
+Executed in the same environment as Phase 7, with only `app/guardrails.py`,
+`app/tools/page_reader.py`, and `app/main.py` changed:
+- `pytest tests/ -v`: **113/113 passed** (all Phase 1-7 regression tests
+  unchanged, plus 16 new Phase 8 tests covering task validation, URL/SSRF
+  validation, and `page_reader` refusing a blocked URL before any HTTP call
+  is attempted).
+- Manual CLI check of the three input-guardrail paths (`python -m app.main`
+  with an empty string, a 3000-character string, and `"??? !!!"`) — each
+  exits with status `1` and a clear one-line error, before any LLM call or
+  network access is attempted.
+- No live web or LLM call was needed for any Phase 8 change or test.
 
 ### Phase 7
 
@@ -547,7 +644,21 @@ compare to the free plan's limits?", so you can watch [TOOL] web_search,
 [TOOL] calculator, and potentially [TOOL] page_reader all fire in one
 run.
 
-## Known limitations (Phase 7 stage, expected)
+## Known limitations (Phase 8 stage, expected)
+
+- `validate_fetch_url` blocks known-local hostnames and literal
+  loopback/private/link-local/reserved IPs, but does **not** resolve
+  hostnames via DNS — so it does not defend against DNS rebinding (a
+  hostname that resolves to a public IP at validation time but a private
+  one at request time). This was a deliberate tradeoff to keep the check
+  pure/offline, consistent with this project's tool-testing convention.
+- Task input validation (`validate_task`) is a small set of deterministic
+  length/shape checks, not an LLM-based "is this actually a sensible
+  research question" classifier — per Phase 8's own "do not over-engineer
+  safety features unrelated to the contest" instruction.
+- Guardrails only cover the two gaps that weren't already handled
+  elsewhere (see the "Guardrails" table above); they don't change any of
+  the existing timeout/retry/fallback behavior from Phases 2-7.
 
 - The critic's quality `issues` (unsupported claims, off-topic sources)
   are surfaced in the report's Limitations section, but don't otherwise

@@ -99,6 +99,64 @@ def test_groq_client_falls_back_to_default_when_no_header():
     assert delay == 7.0
 
 
+def test_groq_client_sends_reasoning_effort_for_gpt_oss_model(monkeypatch):
+    """
+    GPT-OSS models spend part of `max_tokens` on internal reasoning before
+    any visible answer; a request that reasons right up to the limit comes
+    back with an empty `message.content` and NO error (this is what caused
+    live empty-JSON critic responses). `reasoning_effort` bounds that, and
+    must only be sent for models that actually support it.
+    """
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    client = GroqClient(model="openai/gpt-oss-20b", reasoning_effort="low")
+
+    captured = {}
+
+    class FakeMessage:
+        content = "ok"
+
+    class FakeChoice:
+        message = FakeMessage()
+
+    class FakeResponse:
+        choices = [FakeChoice()]
+
+    def fake_create(**kwargs):
+        captured.update(kwargs)
+        return FakeResponse()
+
+    client._client.chat.completions.create = fake_create
+
+    result = client.complete("hello", max_tokens=500)
+    assert result == "ok"
+    assert captured.get("reasoning_effort") == "low"
+
+
+def test_groq_client_omits_reasoning_effort_for_non_oss_model(monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    client = GroqClient(model="llama-3.3-70b-versatile", reasoning_effort="low")
+
+    captured = {}
+
+    class FakeMessage:
+        content = "ok"
+
+    class FakeChoice:
+        message = FakeMessage()
+
+    class FakeResponse:
+        choices = [FakeChoice()]
+
+    def fake_create(**kwargs):
+        captured.update(kwargs)
+        return FakeResponse()
+
+    client._client.chat.completions.create = fake_create
+
+    client.complete("hello", max_tokens=500)
+    assert "reasoning_effort" not in captured
+
+
 if __name__ == "__main__":
     import pytest
     sys.exit(pytest.main([__file__, "-v"]))
